@@ -1,15 +1,31 @@
 # SeaweedFS kernel VFS module
 
+[![kernel build matrix](https://github.com/seaweedfs/seaweedvfs-kmod/actions/workflows/build-matrix.yml/badge.svg)](https://github.com/seaweedfs/seaweedvfs-kmod/actions/workflows/build-matrix.yml)
+
 `seaweedvfs` is a Linux kernel filesystem client for [SeaweedFS](https://github.com/seaweedfs/seaweedfs):
 a real `mount -t seaweedvfs` filesystem. The kernel module owns the VFS (inodes,
 dentries, page cache) and does **zero networking**; all SeaweedFS I/O is handled
 by a userspace daemon over the `/dev/seaweedvfs` character device (the WEKA-style
 thin-module / fat-daemon split).
 
-This repository contains **only the GPL kernel module** (`seaweedvfs.ko`). It does
-not, by itself, give you a working mount — the userspace daemon that drives the
-device is a separate component, available with SeaweedFS. The module is published
-here as the corresponding source for the GPL-licensed `.ko` we ship.
+This repository is the **canonical source** for the GPL-2.0 kernel module
+(`seaweedvfs.ko`). It is the corresponding source for the `.ko` shipped with
+SeaweedFS. The module does not, by itself, give you a working mount — the
+userspace daemon that drives `/dev/seaweedvfs` is a separate component,
+available with SeaweedFS.
+
+## Supported kernels
+
+The [build matrix CI](.github/workflows/build-matrix.yml) validates every commit
+across the following kernels:
+
+| Kernel | Distro | Status |
+|--------|--------|--------|
+| 6.1 LTS | Debian 12 (bookworm) | required |
+| 6.8 | Ubuntu 24.04 | required |
+| 6.12 | Debian 13 (trixie), RHEL 10 | required |
+| 7.0 | Debian sid | required |
+| newest | Fedora rawhide | canary (non-blocking) |
 
 ## License
 
@@ -30,7 +46,7 @@ sudo rmmod seaweedvfs                 # to unload
 
 Requires the kernel headers/build tree for your running kernel
 (`linux-headers-$(uname -r)` on Debian/Ubuntu, `kernel-devel` on RHEL/SUSE) and a
-toolchain (`make`, `gcc`). Targets recent (6.x) kernels.
+toolchain (`make`, `gcc`). Supported kernels: 6.1 LTS → current (see table above).
 
 ### DKMS
 
@@ -50,7 +66,10 @@ sudo dkms install -m seaweedfs-vfs -v <version>
   lock service so they are honoured across mounts/clients (off by default; pair
   with the daemon's `--distributed-locks`).
 
-## Source
+## Relationship to seaweed-mono
 
-This is a published mirror, kept in sync per release with the canonical source.
-Issues and SeaweedFS as a whole: <https://github.com/seaweedfs/seaweedfs>.
+This repository is developed independently; the [seaweed-mono](https://github.com/seaweedfs/seaweed-mono)
+monorepo vendors it at `seaweed-vfs/kernel/` via `git subtree` and syncs
+automatically after each commit here.
+
+Issues and the rest of SeaweedFS: <https://github.com/seaweedfs/seaweedfs>.
