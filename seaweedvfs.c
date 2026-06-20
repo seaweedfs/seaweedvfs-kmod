@@ -23,10 +23,12 @@
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/delay.h>
-#include <linux/filelock.h>
+#if __has_include(<linux/filelock.h>)
+#include <linux/filelock.h>	/* split out of fs.h in 6.5; absent on older LTS */
+#endif
 #include <linux/fs.h>
+#include <linux/fs_context.h>
 #include <linux/init.h>
-#include <linux/io_uring/cmd.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/list.h>
@@ -48,6 +50,13 @@
 #include <linux/xattr.h>
 
 #include "swvfs_proto.h"
+#include "compat.h"
+
+#ifdef SWVFS_HAVE_URING
+#include <linux/io_uring/cmd.h>
+#else
+struct io_uring_cmd;	/* fwd-decl only: swvfs_slot keeps a pointer to it */
+#endif
 
 /* When set (insmod distributed_locks=1), advisory locks (flock) are routed
  * through the daemon to the filer's lock service so they hold across mounts;
@@ -374,6 +383,7 @@ static ssize_t swvfs_dev_write(struct file *f, const char __user *buf,
 	return len;
 }
 
+#ifdef SWVFS_HAVE_URING
 /* ---- io_uring_cmd ring transport ------------------------------------------ */
 /*
  * A ublk-style ring: the daemon arms FETCH commands that park until a request
@@ -684,6 +694,10 @@ static void swvfs_kick(void)
 	if (cmd)
 		io_uring_cmd_complete_in_task(cmd, swvfs_deliver_cb);
 }
+#else
+/* No io_uring ring transport on this kernel: char-device transport only. */
+static void swvfs_kick(void) { }
+#endif /* SWVFS_HAVE_URING */
 
 static int swvfs_dev_open(struct inode *inode, struct file *f)
 {
@@ -752,7 +766,9 @@ static const struct file_operations swvfs_dev_fops = {
 	.release = swvfs_dev_release,
 	.read = swvfs_dev_read,
 	.write = swvfs_dev_write,
+#ifdef SWVFS_HAVE_URING
 	.uring_cmd = swvfs_dev_uring_cmd,
+#endif
 	.llseek = noop_llseek,
 };
 
@@ -785,9 +801,9 @@ static void swvfs_apply_attr(struct inode *inode, const struct swvfs_attr *a)
 	 * on-disk layout); decode it into a kernel dev_t. */
 	inode->i_rdev = new_decode_dev(a->rdev);
 	i_size_write(inode, a->size);
-	inode_set_mtime(inode, a->mtime_sec, a->mtime_nsec);
+	SWVFS_INODE_SET_MTIME(inode, a->mtime_sec, a->mtime_nsec);
 	inode_set_ctime(inode, a->ctime_sec, a->ctime_nsec);
-	inode_set_atime(inode, a->atime_sec, a->atime_nsec);
+	SWVFS_INODE_SET_ATIME(inode, a->atime_sec, a->atime_nsec);
 	/* A regular file with no set-id bits has nothing for the write path to
 	 * strip, so mark it S_NOSEC: file_remove_privs() then short-circuits
 	 * instead of issuing a GETXATTR (security.capability) upcall on every
@@ -810,7 +826,7 @@ static struct inode *swvfs_iget(struct super_block *sb,
 		return ERR_PTR(-ENOMEM);
 
 	swvfs_apply_attr(inode, a);
-	if (inode->i_state & I_NEW) {
+	if (SWVFS_I_STATE(inode) & I_NEW) {
 		if (S_ISDIR(inode->i_mode)) {
 			inode->i_op = &seaweedvfs_dir_inode_ops;
 			inode->i_fop = &seaweedvfs_dir_ops;
@@ -955,7 +971,7 @@ static int seaweedvfs_read_folio(struct file *file, struct folio *folio)
 	err = buf ? swvfs_read_into(path, strlen(path), folio_pos(folio), buf, len)
 		  : -ENOMEM;
 	if (!err)
-		memcpy_to_folio(folio, 0, buf, len);
+		SWVFS_MEMCPY_TO_FOLIO(folio, 0, buf, len);
 	kvfree(buf);
 	kfree(pbuf);
 	if (!err)
@@ -976,7 +992,7 @@ static void swvfs_ra_fill_folio(struct folio *folio, const char *buf,
 		size_t avail = foff < total ? min_t(size_t, flen, total - foff) : 0;
 
 		if (avail)
-			memcpy_to_folio(folio, 0, buf + foff, avail);
+			SWVFS_MEMCPY_TO_FOLIO(folio, 0, buf + foff, avail);
 		if (avail < flen)
 			folio_zero_range(folio, avail, flen - avail);
 		folio_mark_uptodate(folio);
@@ -1216,7 +1232,7 @@ static struct dentry *seaweedvfs_lookup(struct inode *dir,
 	return d_splice_alias(inode, dentry);
 }
 
-static int seaweedvfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+static int seaweedvfs_getattr(SWVFS_IDMAP idmap, const struct path *path,
 			      struct kstat *stat, u32 request_mask,
 			      unsigned int flags)
 {
@@ -1237,7 +1253,7 @@ static int seaweedvfs_getattr(struct mnt_idmap *idmap, const struct path *path,
 			swvfs_free_req(r);
 		}
 	}
-	generic_fillattr(idmap, request_mask, inode, stat);
+	SWVFS_FILLATTR(idmap, request_mask, inode, stat);
 	return 0;
 }
 
@@ -1279,7 +1295,7 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 	return err;
 }
 
-static int seaweedvfs_create(struct mnt_idmap *idmap, struct inode *dir,
+static int seaweedvfs_create(SWVFS_IDMAP idmap, struct inode *dir,
 			     struct dentry *dentry, umode_t mode, bool excl)
 {
 	return swvfs_make(dir, dentry, mode, SWVFS_OP_CREATE);
@@ -1344,15 +1360,17 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 	return err;
 }
 
-static int seaweedvfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-			    struct dentry *dentry, umode_t mode)
+static SWVFS_MKDIR_RET seaweedvfs_mkdir(SWVFS_IDMAP idmap, struct inode *dir,
+					struct dentry *dentry, umode_t mode)
 {
-	return swvfs_make(dir, dentry, mode | S_IFDIR, SWVFS_OP_MKDIR);
+	int err = swvfs_make(dir, dentry, mode | S_IFDIR, SWVFS_OP_MKDIR);
+
+	return SWVFS_MKDIR_RESULT(err);
 }
 
 /* Create a special file (device node, fifo, or socket). The full st_mode
  * (type | perm) goes in req.mode; the encoded device number in req.size. */
-static int seaweedvfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
+static int seaweedvfs_mknod(SWVFS_IDMAP idmap, struct inode *dir,
 			    struct dentry *dentry, umode_t mode, dev_t rdev)
 {
 	struct swvfs_request *r;
@@ -1424,7 +1442,7 @@ static int seaweedvfs_rmdir(struct inode *dir, struct dentry *dentry)
 	return swvfs_remove(dentry, SWVFS_OP_RMDIR);
 }
 
-static int seaweedvfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
+static int seaweedvfs_setattr(SWVFS_IDMAP idmap, struct dentry *dentry,
 			      struct iattr *iattr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -1480,7 +1498,7 @@ static int seaweedvfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry,
 	return err;
 }
 
-static int seaweedvfs_symlink(struct mnt_idmap *idmap, struct inode *dir,
+static int seaweedvfs_symlink(SWVFS_IDMAP idmap, struct inode *dir,
 			      struct dentry *dentry, const char *symname)
 {
 	struct swvfs_request *r;
@@ -1558,7 +1576,7 @@ static const char *seaweedvfs_get_link(struct dentry *dentry,
 	return target;
 }
 
-static int seaweedvfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
+static int seaweedvfs_rename(SWVFS_IDMAP idmap, struct inode *old_dir,
 			     struct dentry *old_dentry, struct inode *new_dir,
 			     struct dentry *new_dentry, unsigned int flags)
 {
@@ -1611,9 +1629,9 @@ static int seaweedvfs_rename(struct mnt_idmap *idmap, struct inode *old_dir,
 	 * see swvfs_make). Manual inc/drop here would race set_nlink from a
 	 * concurrent attr refresh and underflow to 0 -> WARN.
 	 */
-	inode_set_mtime_to_ts(old_dir, inode_set_ctime_current(old_dir));
+	SWVFS_INODE_SET_MTIME_TS(old_dir, inode_set_ctime_current(old_dir));
 	if (new_dir != old_dir)
-		inode_set_mtime_to_ts(new_dir, inode_set_ctime_current(new_dir));
+		SWVFS_INODE_SET_MTIME_TS(new_dir, inode_set_ctime_current(new_dir));
 	return 0;
 }
 
@@ -1735,7 +1753,7 @@ static ssize_t seaweedvfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	if (written > 0) {
 		if (pos > i_size_read(inode))
 			i_size_write(inode, pos);
-		inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+		SWVFS_INODE_SET_MTIME_TS(inode, inode_set_ctime_current(inode));
 		iocb->ki_pos = pos;
 		invalidate_inode_pages2_range(inode->i_mapping,
 					      start >> PAGE_SHIFT,
@@ -1788,8 +1806,8 @@ static int seaweedvfs_release_file(struct inode *inode, struct file *file)
 static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 			   bool is_flock, bool getlk, bool blocking)
 {
-	bool unlock = lock_is_unlock(fl);
-	u32 type = unlock ? 3 : (lock_is_read(fl) ? 1 : 2);
+	bool unlock = SWVFS_FL_IS_UNLOCK(fl);
+	u32 type = unlock ? 3 : (SWVFS_FL_IS_READ(fl) ? 1 : 2);
 
 	for (;;) {
 		struct swvfs_request *r;
@@ -1811,10 +1829,10 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 		r->req.mode = getlk ? SWVFS_LOCK_GETLK :
 			      unlock ? SWVFS_LOCK_UNLOCK : SWVFS_LOCK_TRY;
 		r->req.uid = type;
-		r->req.gid = fl->c.flc_pid;
+		r->req.gid = SWVFS_FL_PID(fl);
 		r->req.offset = fl->fl_start;
 		r->req.size = fl->fl_end;
-		r->req.mtime_sec = (s64)(unsigned long)fl->c.flc_owner;
+		r->req.mtime_sec = (s64)(unsigned long)SWVFS_FL_OWNER(fl);
 		r->req.valid = is_flock ? SWVFS_LOCK_FLOCK : 0;
 		err = swvfs_send(r);
 
@@ -1822,14 +1840,14 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 			if (err == 0 && r->reply.nentries) {
 				/* Map the wire type (1 rd / 2 wr / 3 unlock) back to
 				 * the kernel's F_RDLCK / F_WRLCK / F_UNLCK. */
-				fl->c.flc_type = r->reply.attr.mode == 1 ? F_RDLCK :
-						 r->reply.attr.mode == 2 ? F_WRLCK :
-									   F_UNLCK;
+				SWVFS_FL_TYPE(fl) = r->reply.attr.mode == 1 ? F_RDLCK :
+						    r->reply.attr.mode == 2 ? F_WRLCK :
+									      F_UNLCK;
 				fl->fl_start = r->reply.attr.size;
 				fl->fl_end = r->reply.attr.mtime_sec;
-				fl->c.flc_pid = r->reply.attr.uid;
+				SWVFS_FL_PID(fl) = r->reply.attr.uid;
 			} else if (err == 0) {
-				fl->c.flc_type = F_UNLCK;
+				SWVFS_FL_TYPE(fl) = F_UNLCK;
 			}
 			swvfs_free_req(r);
 			return err;
@@ -1854,7 +1872,7 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 
 static int seaweedvfs_flock(struct file *file, int cmd, struct file_lock *fl)
 {
-	return swvfs_dist_lock(file, fl, true, false, fl->c.flc_flags & FL_SLEEP);
+	return swvfs_dist_lock(file, fl, true, false, SWVFS_FL_FLAGS(fl) & FL_SLEEP);
 }
 
 static int seaweedvfs_lock(struct file *file, int cmd, struct file_lock *fl)
@@ -1911,7 +1929,7 @@ static int seaweedvfs_xattr_get(const struct xattr_handler *handler,
 }
 
 static int seaweedvfs_xattr_set(const struct xattr_handler *handler,
-				struct mnt_idmap *idmap, struct dentry *dentry,
+				SWVFS_IDMAP idmap, struct dentry *dentry,
 				struct inode *inode, const char *name,
 				const void *value, size_t size, int flags)
 {
@@ -2092,9 +2110,16 @@ static int seaweedvfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+/* Always evict on last unref (no on-disk inode cache); same as the
+ * generic_delete_inode helper, which 7.0 removed. */
+static int seaweedvfs_drop_inode(struct inode *inode)
+{
+	return 1;
+}
+
 static const struct super_operations seaweedvfs_super_ops = {
 	.statfs = seaweedvfs_statfs,
-	.drop_inode = generic_delete_inode,
+	.drop_inode = seaweedvfs_drop_inode,
 };
 
 static struct inode *swvfs_make_root(struct super_block *sb)
@@ -2107,28 +2132,29 @@ static struct inode *swvfs_make_root(struct super_block *sb)
 	inode->i_mode = S_IFDIR | 0755;
 	inode->i_uid = current_fsuid();
 	inode->i_gid = current_fsgid();
-	simple_inode_init_ts(inode);
+	SWVFS_INODE_INIT_TS(inode);
 	inode->i_op = &seaweedvfs_dir_inode_ops;
 	inode->i_fop = &seaweedvfs_dir_ops;
 	set_nlink(inode, 2);
 	return inode;
 }
 
-static int seaweedvfs_fill_super(struct super_block *sb, void *data, int silent)
+static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *root;
 	int err;
 
 	sb->s_magic = SEAWEEDVFS_MAGIC;
 	sb->s_op = &seaweedvfs_super_ops;
-	sb->s_xattr = seaweedvfs_xattr_handlers;
+	/* s_xattr lost an inner const across versions; cast to its actual type. */
+	sb->s_xattr = (typeof(sb->s_xattr))seaweedvfs_xattr_handlers;
 	sb->s_blocksize = PAGE_SIZE;
 	sb->s_blocksize_bits = PAGE_SHIFT;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_time_gran = 1;
 	sb->s_flags |= SB_NOSEC; /* allow S_NOSEC caching (see swvfs_apply_attr) */
 
-	/* mount_nodev leaves s_bdi as the noop bdi (ra_pages = 0), which disables
+	/* get_tree_nodev leaves s_bdi as the noop bdi (ra_pages = 0), which disables
 	 * read-ahead entirely — cold reads would then fault one folio at a time,
 	 * one daemon upcall + one tiny range read per 4 KiB. Set up a real bdi so
 	 * the page cache batches reads into our SWVFS_READAHEAD_MAX upcalls. */
@@ -2149,11 +2175,21 @@ static int seaweedvfs_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 }
 
-static struct dentry *seaweedvfs_mount(struct file_system_type *fs_type,
-				       int flags, const char *dev_name,
-				       void *data)
+/* fs_context mount path (the legacy ->mount/mount_nodev hook was removed in
+ * 7.0). We parse no options, so the context just wires get_tree_nodev. */
+static int seaweedvfs_get_tree(struct fs_context *fc)
 {
-	return mount_nodev(fs_type, flags, data, seaweedvfs_fill_super);
+	return get_tree_nodev(fc, seaweedvfs_fill_super);
+}
+
+static const struct fs_context_operations seaweedvfs_context_ops = {
+	.get_tree = seaweedvfs_get_tree,
+};
+
+static int seaweedvfs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &seaweedvfs_context_ops;
+	return 0;
 }
 
 static void seaweedvfs_kill_sb(struct super_block *sb)
@@ -2165,7 +2201,7 @@ static void seaweedvfs_kill_sb(struct super_block *sb)
 static struct file_system_type seaweedvfs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "seaweedvfs",
-	.mount = seaweedvfs_mount,
+	.init_fs_context = seaweedvfs_init_fs_context,
 	.kill_sb = seaweedvfs_kill_sb,
 	.fs_flags = 0,
 };
