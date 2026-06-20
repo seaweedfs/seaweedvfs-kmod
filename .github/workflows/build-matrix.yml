@@ -1,0 +1,65 @@
+name: kernel build matrix
+
+# Compile seaweedvfs.ko against each target kernel's headers in a distro
+# container. This is the source of truth for which kernels are supported: when an
+# entry here breaks on a new kernel, add a shim to compat.h. Entries flagged
+# `optional` are the not-yet-ported targets — they track progress without failing
+# the run; promote them to required once green.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: "build · ${{ matrix.label }}"
+    runs-on: ubuntu-22.04
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- supported (must build) ---
+          - label: "6.12 · Debian 13"
+            image: debian:trixie
+            install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
+            kdir: /usr/src/linux-headers-*-amd64
+          - label: "6.12-cloud · Debian 13"
+            image: debian:trixie
+            install: apt-get update && apt-get install -y build-essential kmod linux-headers-cloud-amd64
+            kdir: /usr/src/linux-headers-*-cloud-amd64
+          - label: "6.12 · RHEL 10"
+            image: almalinux:10
+            install: dnf install -y gcc make kmod kernel-devel
+            kdir: /usr/src/kernels/*
+          # --- target range, not yet ported (tracking, non-blocking) ---
+          - label: "6.1 LTS · Debian 12"
+            image: debian:bookworm
+            install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
+            kdir: /usr/src/linux-headers-*-amd64
+            optional: true
+          - label: "newest · Debian sid"
+            image: debian:sid
+            install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
+            kdir: /usr/src/linux-headers-*-amd64
+            optional: true
+          - label: "newest · Fedora rawhide"
+            image: fedora:rawhide
+            install: dnf install -y gcc make kmod kernel-devel
+            kdir: /usr/src/kernels/*
+            optional: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Build in ${{ matrix.image }}"
+        run: |
+          docker run --rm -v "$PWD":/src -w /src ${{ matrix.image }} bash -euxc '
+            ${{ matrix.install }}
+            KDIR=$(ls -d ${{ matrix.kdir }} | grep -vi common | sort -V | tail -1)
+            test -d "$KDIR"
+            echo "Building against $(cat "$KDIR/include/config/kernel.release" 2>/dev/null)"
+            make KDIR="$KDIR"
+            modinfo seaweedvfs.ko | grep -E "vermagic|version:"
+          '

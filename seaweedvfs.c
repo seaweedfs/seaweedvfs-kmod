@@ -48,6 +48,7 @@
 #include <linux/xattr.h>
 
 #include "swvfs_proto.h"
+#include "compat.h"
 
 /* When set (insmod distributed_locks=1), advisory locks (flock) are routed
  * through the daemon to the filer's lock service so they hold across mounts;
@@ -1344,10 +1345,12 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 	return err;
 }
 
-static int seaweedvfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
-			    struct dentry *dentry, umode_t mode)
+static SWVFS_MKDIR_RET seaweedvfs_mkdir(struct mnt_idmap *idmap, struct inode *dir,
+					struct dentry *dentry, umode_t mode)
 {
-	return swvfs_make(dir, dentry, mode | S_IFDIR, SWVFS_OP_MKDIR);
+	int err = swvfs_make(dir, dentry, mode | S_IFDIR, SWVFS_OP_MKDIR);
+
+	return SWVFS_MKDIR_RESULT(err);
 }
 
 /* Create a special file (device node, fifo, or socket). The full st_mode
