@@ -5,8 +5,7 @@
 `seaweedvfs` is a Linux kernel filesystem client for [SeaweedFS](https://github.com/seaweedfs/seaweedfs):
 a real `mount -t seaweedvfs` filesystem. The kernel module owns the VFS (inodes,
 dentries, page cache) and does **zero networking**; all SeaweedFS I/O is handled
-by a userspace daemon over the `/dev/seaweedvfs` character device (the WEKA-style
-thin-module / fat-daemon split).
+by a userspace daemon over the `/dev/seaweedvfs` character device.
 
 This repository is the **canonical source** for the GPL-2.0 kernel module
 (`seaweedvfs.ko`). It is the corresponding source for the `.ko` shipped with
