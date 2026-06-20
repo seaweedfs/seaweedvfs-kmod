@@ -22,7 +22,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- supported (must build): 6.8 .. current ---
+          # --- supported (must build): 6.1 .. current ---
+          - label: "6.1 LTS · Debian 12"
+            image: debian:bookworm
+            install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
+            kdir: /usr/src/linux-headers-*-amd64
           - label: "6.8 · Ubuntu 24.04"
             image: ubuntu:24.04
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-generic

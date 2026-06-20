@@ -82,6 +82,52 @@
 #endif
 
 /*
+ * 6.3: VFS idmapping switched struct user_namespace* -> struct mnt_idmap* across
+ * inode-op and xattr-handler signatures (and setattr_prepare/setattr_copy/
+ * generic_fillattr). SWVFS_IDMAP is the first param of every such hook; passing
+ * it through to the VFS helpers is type-correct on both layouts. Version-guarded
+ * (not header-probed: the type exists via fs.h even where linux/mnt_idmap.h
+ * isn't shipped separately); the only sub-6.3 in-scope kernel is mainline 6.1.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+# define SWVFS_IDMAP struct mnt_idmap *
+#else
+# define SWVFS_IDMAP struct user_namespace *
+#endif
+
+/*
+ * 6.6: inode mtime/atime setters, simple_inode_init_ts(), generic_fillattr()'s
+ * request_mask arg, and memcpy_to_folio() landed together (inode_set_ctime*
+ * predate 6.6 and are used directly). Mainline changes that no in-scope kernel
+ * backports below 6.6 (the floor is mainline 6.1), so guard by version; on older
+ * kernels the i_mtime/i_atime fields are still directly accessible.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+# define SWVFS_INODE_SET_MTIME(inode, s, ns)  inode_set_mtime((inode), (s), (ns))
+# define SWVFS_INODE_SET_ATIME(inode, s, ns)  inode_set_atime((inode), (s), (ns))
+# define SWVFS_INODE_SET_MTIME_TS(inode, ts)  inode_set_mtime_to_ts((inode), (ts))
+# define SWVFS_INODE_INIT_TS(inode)     simple_inode_init_ts(inode)
+# define SWVFS_FILLATTR(idmap, mask, inode, stat) \
+		generic_fillattr((idmap), (mask), (inode), (stat))
+# define SWVFS_MEMCPY_TO_FOLIO(f, off, src, len) \
+		memcpy_to_folio((f), (off), (src), (len))
+#else
+# define SWVFS_INODE_SET_MTIME(inode, s, ns) \
+		((inode)->i_mtime = (struct timespec64){ .tv_sec = (s), .tv_nsec = (ns) })
+# define SWVFS_INODE_SET_ATIME(inode, s, ns) \
+		((inode)->i_atime = (struct timespec64){ .tv_sec = (s), .tv_nsec = (ns) })
+# define SWVFS_INODE_SET_MTIME_TS(inode, ts)  ((inode)->i_mtime = (ts))
+# define SWVFS_INODE_INIT_TS(inode) \
+		((inode)->i_atime = (inode)->i_mtime = inode_set_ctime_current(inode))
+# define SWVFS_FILLATTR(idmap, mask, inode, stat) \
+		generic_fillattr((idmap), (inode), (stat))
+/* 64-bit targets (amd64/arm64): folios live in the linear map, so
+ * folio_address + offset is valid across the whole folio. */
+# define SWVFS_MEMCPY_TO_FOLIO(f, off, src, len) \
+		memcpy(folio_address(f) + (off), (src), (len))
+#endif
+
+/*
  * io_uring_cmd ring transport (optional fast path beside read()/write()). The
  * cmd API churns at both ends of 6.12: helpers like io_uring_cmd_to_pdu are not
  * all present until ~6.12, and the task-work/cmd API changes after it
