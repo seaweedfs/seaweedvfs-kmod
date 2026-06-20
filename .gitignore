@@ -4,6 +4,7 @@
 # kbuild + feature-probe build artifacts.
 *.o
 *.o.*
+*.ko
 *.mod
 *.mod.c
 .*.cmd

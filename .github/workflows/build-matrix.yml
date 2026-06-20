@@ -24,22 +24,27 @@ jobs:
         include:
           # --- supported (must build): 6.1 .. current ---
           - label: "6.1 LTS · Debian 12"
+            expect: "6.1."
             image: debian:bookworm
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
             kdir: /usr/src/linux-headers-*-amd64
           - label: "6.8 · Ubuntu 24.04"
+            expect: "6.8."
             image: ubuntu:24.04
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-generic
             kdir: /usr/src/linux-headers-*-generic
           - label: "6.12 · Debian 13"
+            expect: "6.12."
             image: debian:trixie
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
             kdir: /usr/src/linux-headers-*-amd64
           - label: "6.12-cloud · Debian 13"
+            expect: "6.12."
             image: debian:trixie
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-cloud-amd64
             kdir: /usr/src/linux-headers-*-cloud-amd64
           - label: "6.12 · RHEL 10"
+            expect: "6.12."
             image: almalinux:10
             install: dnf install -y gcc make kmod kernel-devel
             kdir: /usr/src/kernels/*
@@ -61,7 +66,11 @@ jobs:
             ${{ matrix.install }}
             KDIR=$(ls -d ${{ matrix.kdir }} | grep -vi common | sort -V | tail -1)
             test -d "$KDIR"
-            echo "Building against $(cat "$KDIR/include/config/kernel.release" 2>/dev/null)"
+            KR=$(cat "$KDIR/include/config/kernel.release" 2>/dev/null)
+            echo "Building against $KR"
+            # Fail if a fixed-kernel distro drifts off the version this entry
+            # claims (empty expect = floating sid/rawhide, so this is a no-op).
+            case "$KR" in "${{ matrix.expect }}"*) ;; *) echo "::error::expected ${{ matrix.expect }}x, got $KR"; exit 1 ;; esac
             make KDIR="$KDIR"
             modinfo seaweedvfs.ko | grep -E "vermagic|version:"
           '
