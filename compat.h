@@ -67,7 +67,9 @@
  * char-device transport until it is re-ported. Requires CONFIG_IO_URING.
  */
 #if defined(CONFIG_IO_URING) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
-# define SWVFS_HAVE_URING 1
+# if __has_include(<linux/io_uring/cmd.h>)	/* the cmd API header lands ~6.7 */
+#  define SWVFS_HAVE_URING 1
+# endif
 #endif
 
 #endif /* _SWVFS_COMPAT_H */
