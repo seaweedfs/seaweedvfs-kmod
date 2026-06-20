@@ -63,14 +63,17 @@ jobs:
 
           # Pull the latest from kmod into the subtree prefix.
           # --squash keeps mono history clean (one merge commit per sync).
+          PREV_SHA=$(git rev-parse HEAD)
           git subtree pull \
             --prefix=seaweed-vfs/kernel \
             https://github.com/seaweedfs/seaweedvfs-kmod.git main \
             --squash \
             --message "seaweed-vfs/kernel: sync from seaweedvfs-kmod (auto)"
 
-          # Check whether the subtree pull actually changed anything.
-          if git diff --quiet HEAD~1 HEAD -- seaweed-vfs/kernel/; then
+          # A no-op subtree pull creates no commit, so HEAD is unchanged. Compare
+          # SHAs rather than git-diff (which would falsely fire if the tip commit
+          # happened to touch seaweed-vfs/kernel/).
+          if [ "$(git rev-parse HEAD)" = "$PREV_SHA" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true"  >> "$GITHUB_OUTPUT"
@@ -82,10 +85,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.MONO_SYNC_TOKEN }}
         run: |
-          git push origin "${{ steps.pull.outputs.branch }}"
-          gh pr create \
-            --repo seaweedfs/seaweed-mono \
-            --head "${{ steps.pull.outputs.branch }}" \
-            --base main \
-            --title "seaweed-vfs/kernel: sync from seaweedvfs-kmod" \
-            --body "Automated subtree sync from [seaweedvfs-kmod](https://github.com/seaweedfs/seaweedvfs-kmod). Review the diff and merge when CI is green."
+          # Force-push: a same-day re-run reuses the date-based branch name, so
+          # the remote branch may already exist from an earlier sync.
+          git push origin "${{ steps.pull.outputs.branch }}" --force
+          # Only open a PR if one isn't already open for this branch (idempotent).
+          if ! gh pr list --repo seaweedfs/seaweed-mono \
+                 --head "${{ steps.pull.outputs.branch }}" --state open | grep -q .; then
+            gh pr create \
+              --repo seaweedfs/seaweed-mono \
+              --head "${{ steps.pull.outputs.branch }}" \
+              --base main \
+              --title "seaweed-vfs/kernel: sync from seaweedvfs-kmod" \
+              --body "Automated subtree sync from [seaweedvfs-kmod](https://github.com/seaweedfs/seaweedvfs-kmod). Review the diff and merge when CI is green."
+          fi
