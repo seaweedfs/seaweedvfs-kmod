@@ -7,11 +7,9 @@ a real `mount -t seaweedvfs` filesystem. The kernel module owns the VFS (inodes,
 dentries, page cache) and does **zero networking**; all SeaweedFS I/O is handled
 by a userspace daemon over the `/dev/seaweedvfs` character device.
 
-This repository is the **canonical source** for the GPL-2.0 kernel module
-(`seaweedvfs.ko`). It is the corresponding source for the `.ko` shipped with
-SeaweedFS. The module does not, by itself, give you a working mount — the
-userspace daemon that drives `/dev/seaweedvfs` is a separate component,
-available with SeaweedFS.
+This repository contains the GPL-2.0 kernel module (`seaweedvfs.ko`). The module
+does not, by itself, give you a working mount — the userspace daemon that drives
+`/dev/seaweedvfs` is a separate component, available with SeaweedFS.
 
 ## Supported kernels
 
