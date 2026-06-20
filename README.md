@@ -66,10 +66,10 @@ Three packages per release — pick **one** module package + the daemon:
 sudo apt install ./seaweedfs-vfs-dkms_<ver>_all.deb ./seaweedfs-vfs_<ver>_amd64.deb
 # ...or a precompiled module (no compiler/headers on the box):
 sudo apt install --no-install-recommends \
-  ./seaweedfs-vfs-kmod-$(uname -r)_amd64.deb ./seaweedfs-vfs_<ver>_amd64.deb
+  ./seaweedfs-vfs-kmod-$(uname -r)_<ver>_amd64.deb ./seaweedfs-vfs_<ver>_amd64.deb
 
 # RHEL / Fedora  (on SUSE swap `dnf` -> `zypper install`)
-sudo dnf install ./seaweedfs-vfs-dkms-<ver>.noarch.rpm ./seaweedfs-vfs-<ver>.x86_64.rpm
+sudo dnf install ./seaweedfs-vfs-dkms-<ver>-1.noarch.rpm ./seaweedfs-vfs-<ver>-1.x86_64.rpm
 ```
 
 ### Kubernetes / immutable hosts
