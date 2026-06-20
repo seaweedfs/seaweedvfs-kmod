@@ -1,4 +1,4 @@
-# seaweedvfs — SeaweedFS kernel VFS module
+# SeaweedFS kernel VFS module
 
 `seaweedvfs` is a Linux kernel filesystem client for [SeaweedFS](https://github.com/seaweedfs/seaweedfs):
 a real `mount -t seaweedvfs` filesystem. The kernel module owns the VFS (inodes,
