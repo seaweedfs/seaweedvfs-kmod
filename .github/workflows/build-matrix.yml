@@ -9,6 +9,10 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Nightly at 03:00 UTC — catches distro package updates that silently bump
+    # the kernel headers inside a floating image (sid, rawhide, etc.)
+    - cron: '0 3 * * *'
 
 permissions:
   contents: read
