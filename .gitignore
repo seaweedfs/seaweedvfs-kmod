@@ -10,3 +10,4 @@
 *.symvers
 modules.order
 .tmp_versions/
+/compat-probes/Kbuild

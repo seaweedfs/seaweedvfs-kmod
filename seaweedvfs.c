@@ -1806,8 +1806,8 @@ static int seaweedvfs_release_file(struct inode *inode, struct file *file)
 static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 			   bool is_flock, bool getlk, bool blocking)
 {
-	bool unlock = lock_is_unlock(fl);
-	u32 type = unlock ? 3 : (lock_is_read(fl) ? 1 : 2);
+	bool unlock = SWVFS_FL_IS_UNLOCK(fl);
+	u32 type = unlock ? 3 : (SWVFS_FL_IS_READ(fl) ? 1 : 2);
 
 	for (;;) {
 		struct swvfs_request *r;
@@ -1829,10 +1829,10 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 		r->req.mode = getlk ? SWVFS_LOCK_GETLK :
 			      unlock ? SWVFS_LOCK_UNLOCK : SWVFS_LOCK_TRY;
 		r->req.uid = type;
-		r->req.gid = fl->c.flc_pid;
+		r->req.gid = SWVFS_FL_PID(fl);
 		r->req.offset = fl->fl_start;
 		r->req.size = fl->fl_end;
-		r->req.mtime_sec = (s64)(unsigned long)fl->c.flc_owner;
+		r->req.mtime_sec = (s64)(unsigned long)SWVFS_FL_OWNER(fl);
 		r->req.valid = is_flock ? SWVFS_LOCK_FLOCK : 0;
 		err = swvfs_send(r);
 
@@ -1840,14 +1840,14 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 			if (err == 0 && r->reply.nentries) {
 				/* Map the wire type (1 rd / 2 wr / 3 unlock) back to
 				 * the kernel's F_RDLCK / F_WRLCK / F_UNLCK. */
-				fl->c.flc_type = r->reply.attr.mode == 1 ? F_RDLCK :
-						 r->reply.attr.mode == 2 ? F_WRLCK :
-									   F_UNLCK;
+				SWVFS_FL_TYPE(fl) = r->reply.attr.mode == 1 ? F_RDLCK :
+						    r->reply.attr.mode == 2 ? F_WRLCK :
+									      F_UNLCK;
 				fl->fl_start = r->reply.attr.size;
 				fl->fl_end = r->reply.attr.mtime_sec;
-				fl->c.flc_pid = r->reply.attr.uid;
+				SWVFS_FL_PID(fl) = r->reply.attr.uid;
 			} else if (err == 0) {
-				fl->c.flc_type = F_UNLCK;
+				SWVFS_FL_TYPE(fl) = F_UNLCK;
 			}
 			swvfs_free_req(r);
 			return err;
@@ -1872,7 +1872,7 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 
 static int seaweedvfs_flock(struct file *file, int cmd, struct file_lock *fl)
 {
-	return swvfs_dist_lock(file, fl, true, false, fl->c.flc_flags & FL_SLEEP);
+	return swvfs_dist_lock(file, fl, true, false, SWVFS_FL_FLAGS(fl) & FL_SLEEP);
 }
 
 static int seaweedvfs_lock(struct file *file, int cmd, struct file_lock *fl)

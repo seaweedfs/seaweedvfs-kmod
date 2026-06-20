@@ -7,7 +7,7 @@
  * module stays version-agnostic. Each shim is one self-contained unit, so the
  * complexity grows with the number of *changed APIs*, not the number of kernels.
  *
- * Supported range: 6.1 LTS .. current mainline (7.0). The kernel build matrix
+ * Supported range: 6.8 .. current mainline (7.0). The kernel build matrix
  * (.github/workflows/) compiles the module against each target kernel and is the
  * source of truth for what is actually supported — when a build there breaks,
  * add the shim here.
@@ -60,16 +60,39 @@
 #endif
 
 /*
- * io_uring_cmd ring transport (optional fast path beside read()/write()). The
- * io_uring task-work + cmd API changed substantially after 6.12 (io_req_tw_func_t
- * callbacks, 3-arg io_uring_cmd_done, 2-arg io_uring_sqe_cmd), so gate the fast
- * path to the kernels it is validated on; newer kernels fall back to the
- * char-device transport until it is re-ported. Requires CONFIG_IO_URING.
+ * ~6.10 moved struct file_lock's type/flags/pid/owner into an embedded
+ * struct file_lock_core (fl->c.flc_*) and added lock_is_unlock()/lock_is_read().
+ * Detected by the feature probe HAVE_FILE_LOCK_CORE. fl_start/fl_end stay on
+ * file_lock in both layouts. The accessors are lvalues (used on both sides).
  */
-#if defined(CONFIG_IO_URING) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 13, 0)
-# if __has_include(<linux/io_uring/cmd.h>)	/* the cmd API header lands ~6.7 */
-#  define SWVFS_HAVE_URING 1
-# endif
+#ifdef HAVE_FILE_LOCK_CORE
+# define SWVFS_FL_IS_UNLOCK(fl)  lock_is_unlock(fl)
+# define SWVFS_FL_IS_READ(fl)    lock_is_read(fl)
+# define SWVFS_FL_TYPE(fl)       ((fl)->c.flc_type)
+# define SWVFS_FL_FLAGS(fl)      ((fl)->c.flc_flags)
+# define SWVFS_FL_PID(fl)        ((fl)->c.flc_pid)
+# define SWVFS_FL_OWNER(fl)      ((fl)->c.flc_owner)
+#else
+# define SWVFS_FL_IS_UNLOCK(fl)  ((fl)->fl_type == F_UNLCK)
+# define SWVFS_FL_IS_READ(fl)    ((fl)->fl_type == F_RDLCK)
+# define SWVFS_FL_TYPE(fl)       ((fl)->fl_type)
+# define SWVFS_FL_FLAGS(fl)      ((fl)->fl_flags)
+# define SWVFS_FL_PID(fl)        ((fl)->fl_pid)
+# define SWVFS_FL_OWNER(fl)      ((fl)->fl_owner)
+#endif
+
+/*
+ * io_uring_cmd ring transport (optional fast path beside read()/write()). The
+ * cmd API churns at both ends of 6.12: helpers like io_uring_cmd_to_pdu are not
+ * all present until ~6.12, and the task-work/cmd API changes after it
+ * (io_req_tw_func_t callbacks, 3-arg io_uring_cmd_done, 2-arg io_uring_sqe_cmd).
+ * So gate the fast path to the 6.12.x window it is validated on; every other
+ * kernel uses the char-device transport until it is re-ported. Needs CONFIG_IO_URING.
+ */
+#if defined(CONFIG_IO_URING) && \
+    LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0) && \
+    LINUX_VERSION_CODE <  KERNEL_VERSION(6, 13, 0)
+# define SWVFS_HAVE_URING 1
 #endif
 
 #endif /* _SWVFS_COMPAT_H */

@@ -22,7 +22,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # --- supported (must build) ---
+          # --- supported (must build): 6.8 .. current ---
+          - label: "6.8 · Ubuntu 24.04"
+            image: ubuntu:24.04
+            install: apt-get update && apt-get install -y build-essential kmod linux-headers-generic
+            kdir: /usr/src/linux-headers-*-generic
           - label: "6.12 · Debian 13"
             image: debian:trixie
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
@@ -35,17 +39,11 @@ jobs:
             image: almalinux:10
             install: dnf install -y gcc make kmod kernel-devel
             kdir: /usr/src/kernels/*
-          # --- target range, not yet ported (tracking, non-blocking) ---
-          - label: "6.1 LTS · Debian 12"
-            image: debian:bookworm
-            install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
-            kdir: /usr/src/linux-headers-*-amd64
-            optional: true
-          - label: "newest · Debian sid"
+          - label: "7.0 · Debian sid"
             image: debian:sid
             install: apt-get update && apt-get install -y build-essential kmod linux-headers-amd64
             kdir: /usr/src/linux-headers-*-amd64
-            optional: true
+          # --- bleeding edge (canary, non-blocking) ---
           - label: "newest · Fedora rawhide"
             image: fedora:rawhide
             install: dnf install -y gcc make kmod kernel-devel

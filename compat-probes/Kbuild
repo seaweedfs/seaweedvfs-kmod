@@ -1,5 +1,0 @@
-# SPDX-License-Identifier: GPL-2.0
-# Feature probes are built one at a time from the top-level Makefile via an
-# `obj-m=<probe>.o` override; this default makes the directory buildable on its
-# own too.
-obj-m := inode_state_read.o
