@@ -4,6 +4,10 @@ name: sync to seaweed-mono
 # PR against seaweedfs/seaweed-mono to pull the latest kmod source in via
 # `git subtree pull`.  The PR is idempotent — if the subtree is already up to
 # date, the script exits early and no PR is created.
+#
+# Requires: add a MONO_SYNC_TOKEN repository secret — a GitHub PAT (classic or
+# fine-grained) with write access to seaweed-mono (Contents + Pull requests).
+# The workflow skips silently when the secret is not yet configured.
 on:
   push:
     branches: [main]
@@ -16,7 +20,27 @@ permissions:
   contents: read  # this repo — writes happen to seaweed-mono via the PAT
 
 jobs:
+  # Gate job: emit configured=true only when the secret is present.
+  # Keeps the sync job from failing with an opaque "token required" error.
+  check-token:
+    runs-on: ubuntu-22.04
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          TOKEN: ${{ secrets.MONO_SYNC_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "MONO_SYNC_TOKEN secret not set — skipping auto-sync." >> "$GITHUB_STEP_SUMMARY"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
   sync:
+    needs: check-token
+    if: needs.check-token.outputs.configured == 'true'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout seaweed-mono
