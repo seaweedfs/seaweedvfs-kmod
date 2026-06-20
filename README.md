@@ -68,7 +68,7 @@ sudo apt install ./seaweedfs-vfs-dkms_<ver>_all.deb ./seaweedfs-vfs_<ver>_amd64.
 sudo apt install --no-install-recommends \
   ./seaweedfs-vfs-kmod-$(uname -r)_amd64.deb ./seaweedfs-vfs_<ver>_amd64.deb
 
-# RHEL / Fedora / SUSE
+# RHEL / Fedora  (on SUSE swap `dnf` -> `zypper install`)
 sudo dnf install ./seaweedfs-vfs-dkms-<ver>.noarch.rpm ./seaweedfs-vfs-<ver>.x86_64.rpm
 ```
 
@@ -97,9 +97,10 @@ sudo modprobe seaweedvfs               # udev then creates /dev/seaweedvfs
 ```
 
 Under **Secure Boot**, `modprobe` fails with *"Key was rejected by service"* unless
-the `.ko` is signed by an enrolled key — sign it (`scripts/sign-file`) with a key
-you `mokutil --import` once, or use the DKMS package (it signs with a per-box MOK
-key and prompts you to enroll it).
+the `.ko` is signed by an enrolled key — sign it with the kernel's `sign-file`
+(shipped with the kernel headers at `/lib/modules/$(uname -r)/build/scripts/sign-file`)
+using a key you `mokutil --import` once, or use the DKMS package (it signs with a
+per-box MOK key and prompts you to enroll it).
 
 ## Build from source
 
