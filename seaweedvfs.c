@@ -23,10 +23,12 @@
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/delay.h>
-#include <linux/filelock.h>
+#if __has_include(<linux/filelock.h>)
+#include <linux/filelock.h>	/* split out of fs.h in 6.5; absent on older LTS */
+#endif
 #include <linux/fs.h>
+#include <linux/fs_context.h>
 #include <linux/init.h>
-#include <linux/io_uring/cmd.h>
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/list.h>
@@ -49,6 +51,12 @@
 
 #include "swvfs_proto.h"
 #include "compat.h"
+
+#ifdef SWVFS_HAVE_URING
+#include <linux/io_uring/cmd.h>
+#else
+struct io_uring_cmd;	/* fwd-decl only: swvfs_slot keeps a pointer to it */
+#endif
 
 /* When set (insmod distributed_locks=1), advisory locks (flock) are routed
  * through the daemon to the filer's lock service so they hold across mounts;
@@ -375,6 +383,7 @@ static ssize_t swvfs_dev_write(struct file *f, const char __user *buf,
 	return len;
 }
 
+#ifdef SWVFS_HAVE_URING
 /* ---- io_uring_cmd ring transport ------------------------------------------ */
 /*
  * A ublk-style ring: the daemon arms FETCH commands that park until a request
@@ -685,6 +694,10 @@ static void swvfs_kick(void)
 	if (cmd)
 		io_uring_cmd_complete_in_task(cmd, swvfs_deliver_cb);
 }
+#else
+/* No io_uring ring transport on this kernel: char-device transport only. */
+static void swvfs_kick(void) { }
+#endif /* SWVFS_HAVE_URING */
 
 static int swvfs_dev_open(struct inode *inode, struct file *f)
 {
@@ -753,7 +766,9 @@ static const struct file_operations swvfs_dev_fops = {
 	.release = swvfs_dev_release,
 	.read = swvfs_dev_read,
 	.write = swvfs_dev_write,
+#ifdef SWVFS_HAVE_URING
 	.uring_cmd = swvfs_dev_uring_cmd,
+#endif
 	.llseek = noop_llseek,
 };
 
@@ -811,7 +826,7 @@ static struct inode *swvfs_iget(struct super_block *sb,
 		return ERR_PTR(-ENOMEM);
 
 	swvfs_apply_attr(inode, a);
-	if (inode->i_state & I_NEW) {
+	if (SWVFS_I_STATE(inode) & I_NEW) {
 		if (S_ISDIR(inode->i_mode)) {
 			inode->i_op = &seaweedvfs_dir_inode_ops;
 			inode->i_fop = &seaweedvfs_dir_ops;
@@ -2095,9 +2110,16 @@ static int seaweedvfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
+/* Always evict on last unref (no on-disk inode cache); same as the
+ * generic_delete_inode helper, which 7.0 removed. */
+static int seaweedvfs_drop_inode(struct inode *inode)
+{
+	return 1;
+}
+
 static const struct super_operations seaweedvfs_super_ops = {
 	.statfs = seaweedvfs_statfs,
-	.drop_inode = generic_delete_inode,
+	.drop_inode = seaweedvfs_drop_inode,
 };
 
 static struct inode *swvfs_make_root(struct super_block *sb)
@@ -2117,7 +2139,7 @@ static struct inode *swvfs_make_root(struct super_block *sb)
 	return inode;
 }
 
-static int seaweedvfs_fill_super(struct super_block *sb, void *data, int silent)
+static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct inode *root;
 	int err;
@@ -2131,7 +2153,7 @@ static int seaweedvfs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_time_gran = 1;
 	sb->s_flags |= SB_NOSEC; /* allow S_NOSEC caching (see swvfs_apply_attr) */
 
-	/* mount_nodev leaves s_bdi as the noop bdi (ra_pages = 0), which disables
+	/* get_tree_nodev leaves s_bdi as the noop bdi (ra_pages = 0), which disables
 	 * read-ahead entirely — cold reads would then fault one folio at a time,
 	 * one daemon upcall + one tiny range read per 4 KiB. Set up a real bdi so
 	 * the page cache batches reads into our SWVFS_READAHEAD_MAX upcalls. */
@@ -2152,11 +2174,21 @@ static int seaweedvfs_fill_super(struct super_block *sb, void *data, int silent)
 	return 0;
 }
 
-static struct dentry *seaweedvfs_mount(struct file_system_type *fs_type,
-				       int flags, const char *dev_name,
-				       void *data)
+/* fs_context mount path (the legacy ->mount/mount_nodev hook was removed in
+ * 7.0). We parse no options, so the context just wires get_tree_nodev. */
+static int seaweedvfs_get_tree(struct fs_context *fc)
 {
-	return mount_nodev(fs_type, flags, data, seaweedvfs_fill_super);
+	return get_tree_nodev(fc, seaweedvfs_fill_super);
+}
+
+static const struct fs_context_operations seaweedvfs_context_ops = {
+	.get_tree = seaweedvfs_get_tree,
+};
+
+static int seaweedvfs_init_fs_context(struct fs_context *fc)
+{
+	fc->ops = &seaweedvfs_context_ops;
+	return 0;
 }
 
 static void seaweedvfs_kill_sb(struct super_block *sb)
@@ -2168,7 +2200,7 @@ static void seaweedvfs_kill_sb(struct super_block *sb)
 static struct file_system_type seaweedvfs_fs_type = {
 	.owner = THIS_MODULE,
 	.name = "seaweedvfs",
-	.mount = seaweedvfs_mount,
+	.init_fs_context = seaweedvfs_init_fs_context,
 	.kill_sb = seaweedvfs_kill_sb,
 	.fs_flags = 0,
 };
