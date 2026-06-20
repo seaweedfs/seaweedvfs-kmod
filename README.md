@@ -66,10 +66,4 @@ sudo dkms install -m seaweedfs-vfs -v <version>
   lock service so they are honoured across mounts/clients (off by default; pair
   with the daemon's `--distributed-locks`).
 
-## Relationship to seaweed-mono
-
-This repository is developed independently; the [seaweed-mono](https://github.com/seaweedfs/seaweed-mono)
-monorepo vendors it at `seaweed-vfs/kernel/` via `git subtree` and syncs
-automatically after each commit here.
-
 Issues and the rest of SeaweedFS: <https://github.com/seaweedfs/seaweedfs>.
