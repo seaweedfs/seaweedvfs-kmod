@@ -1,19 +1,15 @@
 name: sync to seaweed-mono
 
-# After every commit to main (and on a daily schedule as a backstop), open a
-# PR against seaweedfs/seaweed-mono to pull the latest kmod source in via
-# `git subtree pull`.  The PR is idempotent — if the subtree is already up to
-# date, the script exits early and no PR is created.
+# RETIRED as an automatic sync. Kernel-module development now lives in
+# seaweedfs/seaweed-mono under seaweed-vfs/kernel/, which is the source of
+# truth; the forward mono -> kmod sync lives in that repo. This reverse
+# kmod -> mono pull is kept for manual (workflow_dispatch) use only — the
+# push/schedule triggers were removed so it no longer opens conflicting PRs
+# against an already-ahead mono.
 #
-# Requires: add a MONO_SYNC_TOKEN repository secret — a GitHub PAT (classic or
-# fine-grained) with write access to seaweed-mono (Contents + Pull requests).
-# The workflow skips silently when the secret is not yet configured.
+# Requires (manual runs only): a MONO_SYNC_TOKEN repository secret — a GitHub
+# PAT with write access to seaweed-mono (Contents + Pull requests).
 on:
-  push:
-    branches: [main]
-  schedule:
-    # Daily at 04:00 UTC (after the nightly build-matrix run at 03:00)
-    - cron: '0 4 * * *'
   workflow_dispatch:
 
 permissions:

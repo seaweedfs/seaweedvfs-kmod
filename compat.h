@@ -129,6 +129,40 @@
 #endif
 
 /*
+ * The recent VFS dentry rework changed two things this module touches. They
+ * landed together upstream, but each gets its own feature probe (see
+ * compat-probes/) rather than a LINUX_VERSION_CODE guard: these are struct-field
+ * and symbol signatures a compile-test pins exactly, and ->d_revalidate-style fs
+ * callbacks are the kind enterprise distros backport — where the version lies.
+ *
+ *  (a) ->d_revalidate() gained the parent inode and name as leading args:
+ *        int (*)(struct inode *dir, const struct qstr *name,
+ *                struct dentry *dentry, unsigned int flags)
+ *      (was int (*)(struct dentry *, unsigned int)). Those args exist precisely
+ *      because dereferencing dentry->d_parent/->d_name inside d_revalidate races
+ *      the dcache in RCU-walk, so SWVFS_REVAL_DIR takes the parent inode from the
+ *      stable arg on new kernels and from dentry->d_parent on old ones.
+ *      [HAVE_D_REVALIDATE_DIR]
+ *  (b) sb->s_d_op became private; the default dentry_operations are installed
+ *      with set_default_d_op(sb, ops). [HAVE_SET_DEFAULT_D_OP]
+ */
+#ifdef HAVE_D_REVALIDATE_DIR
+# define SWVFS_D_REVALIDATE_ARGS \
+	struct inode *dir, const struct qstr *name, \
+	struct dentry *dentry, unsigned int flags
+# define SWVFS_REVAL_DIR(dentry)  (dir)
+#else
+# define SWVFS_D_REVALIDATE_ARGS  struct dentry *dentry, unsigned int flags
+# define SWVFS_REVAL_DIR(dentry)  d_inode_rcu((dentry)->d_parent)
+#endif
+
+#ifdef HAVE_SET_DEFAULT_D_OP
+# define SWVFS_SET_DEFAULT_D_OP(sb, ops)  set_default_d_op((sb), (ops))
+#else
+# define SWVFS_SET_DEFAULT_D_OP(sb, ops)  ((sb)->s_d_op = (ops))
+#endif
+
+/*
  * io_uring_cmd ring transport (optional fast path beside read()/write()). The
  * cmd API churns at both ends of 6.12: helpers like io_uring_cmd_to_pdu are not
  * all present until ~6.12, and the task-work/cmd API changes after it
