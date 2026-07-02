@@ -35,6 +35,7 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/rcupdate.h>	/* rcu_barrier() before kmem_cache_destroy in exit */
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/pagemap.h>
@@ -66,14 +67,18 @@ module_param(distributed_locks, bool, 0444);
 MODULE_PARM_DESC(distributed_locks,
 		 "route advisory locks (flock) through the filer for cross-mount locking");
 
-#define SEAWEEDVFS_VERSION "0.1.3"
+#define SEAWEEDVFS_VERSION "0.1.4"
 #define SEAWEEDVFS_MAGIC 0x53574653 /* "SWFS" */
 #define SEAWEEDVFS_ROOT_INO 1
 #define SWVFS_TIMEOUT_MS 30000
 #define SWVFS_READAHEAD_MAX (1024 * 1024) /* bytes per READ upcall */
 #define SWVFS_RA_PAGES (4 * 1024 * 1024 / PAGE_SIZE) /* 4 MiB read-ahead window
 						       * = 4 concurrent 1 MiB upcalls */
-#define SWVFS_ATTR_TTL_MS 1000 /* attr cache validity before re-fetching */
+/* Attr cache validity before a getattr re-fetches from the filer. The daemon's
+ * metadata subscription push-invalidates changed inodes in ~ms, so this is only
+ * a backstop for the gaps the subscription can't cover (startup, a reconnect
+ * window, a dropped invalidation) — hence seconds, not the old sub-second TTL. */
+#define SWVFS_ATTR_TTL_MS 30000
 
 /* inode/time/uid helpers come from linux/fs.h; current_fsuid from linux/cred.h. */
 
@@ -137,6 +142,34 @@ struct swvfs_cmd_pdu {
 static struct swvfs_slot swvfs_slots[SWVFS_RING_QD];
 static struct task_struct *swvfs_daemon; /* pinned ring-driver task, or NULL */
 static enum { SWVFS_TP_NONE, SWVFS_TP_LEGACY, SWVFS_TP_RING } swvfs_transport;
+/* Mounted superblocks, so a daemon-pushed invalidation reaches the cached inode
+ * in every mount (inode numbers are hash(path), shared across mounts of the same
+ * filer; a single global pointer invalidated only the most recent mount).
+ * swvfs_sb_sem guards the list: an invalidation holds it for read across the whole
+ * ilookup..iput so a sb can't be torn down underneath it (an inode ref does NOT
+ * pin the sb — evict_inodes just warns and proceeds); fill_super/kill_sb take it
+ * for write. Each sb's link hangs off sb->s_fs_info. */
+struct swvfs_mount {
+	struct list_head node;
+	struct super_block *sb;
+};
+static LIST_HEAD(swvfs_mounts);
+static DECLARE_RWSEM(swvfs_sb_sem);
+
+/* Per-inode state beyond the generic struct inode. cache_gen counts invalidations
+ * pushed for this inode; a slow getattr upcall snapshots it before the call and
+ * re-checks after, dropping a reply that raced an invalidation instead of
+ * re-stamping stale attrs as fresh (see seaweedvfs_getattr). */
+struct swvfs_inode {
+	struct inode vfs_inode;
+	atomic_t cache_gen;
+};
+static struct kmem_cache *swvfs_inode_cachep;
+
+static inline struct swvfs_inode *SWVFS_I(struct inode *inode)
+{
+	return container_of(inode, struct swvfs_inode, vfs_inode);
+}
 
 static void swvfs_kick(void);
 
@@ -319,6 +352,93 @@ efault:
 	return -EFAULT;
 }
 
+/* Daemon-pushed cache invalidation (a write whose tag is 0, which is never a
+ * request tag): the inode named by hdr.attr.ino changed on another client.
+ *
+ * For a file inode we drop its attr stamp (the next getattr re-fetches) and its
+ * page cache. invalidate_inode_pages2_range (not invalidate_mapping_pages) is
+ * deliberate: it locks each folio, so it waits out an in-flight read-ahead that
+ * is about to install now-stale bytes, and it unmaps mmap'd folios — neither of
+ * which invalidate_mapping_pages does, so that path lost races with reads/mmap.
+ *
+ * cache_gen is bumped first. For a file it makes getattr and in-flight reads
+ * re-fetch. For a directory the same counter is its namespace generation: each
+ * child dentry records the parent's gen when cached, and d_revalidate re-resolves
+ * any child whose snapshot is now stale. The VFS calls d_revalidate on cached
+ * dentries — positive AND negative — in the lookup and open paths (lookup_open /
+ * lookup_fast), so the generation alone covers remote creates (stale negatives),
+ * deletes, and renames, including names a process holds open or is looking up
+ * concurrently. We deliberately do NOT shrink_dcache the subtree per event: it is
+ * unnecessary given the generation check, and a single change (e.g. at the root)
+ * would synchronously evict most of the mount's cache.
+ *
+ * invalidate_inode_pages2_range then drops the page cache (a no-op for a
+ * directory mapping).
+ *
+ * Every mounted sb is visited (inode numbers are shared across mounts).
+ * swvfs_sb_sem is held for read across the whole walk so kill_sb (which takes it
+ * for write) can't free a sb while we still reference one of its inodes. */
+static void swvfs_invalidate(u64 ino)
+{
+	struct swvfs_mount *m;
+
+	if (ino == 0)
+		return;
+	down_read(&swvfs_sb_sem);
+	list_for_each_entry(m, &swvfs_mounts, node) {
+		struct inode *inode = ilookup(m->sb, ino);
+
+		if (!inode)
+			continue;
+		atomic_inc(&SWVFS_I(inode)->cache_gen);
+		inode->i_private = NULL; /* next getattr re-fetches */
+		invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
+		iput(inode);
+	}
+	up_read(&swvfs_sb_sem);
+}
+
+/* Invalidate every cached inode in one sb: bump each generation (re-fetching
+ * attrs, re-resolving child names, discarding in-flight reads) and drop page
+ * caches. Walks sb->s_inodes with the standard pin-the-cursor dance so the list
+ * stays valid across the lock drops the per-inode work needs (cf.
+ * drop_pagecache_sb). igrab skips inodes already being freed. */
+static void swvfs_flush_sb(struct super_block *sb)
+{
+	struct inode *inode, *toput = NULL;
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		struct inode *pinned = igrab(inode);
+
+		if (!pinned)
+			continue; /* being freed; list lock still held, cursor safe */
+		spin_unlock(&sb->s_inode_list_lock);
+		iput(toput);	/* release the previous iteration's anchor */
+		toput = pinned;	/* keep this one pinned to anchor the cursor */
+		atomic_inc(&SWVFS_I(pinned)->cache_gen);
+		pinned->i_private = NULL;
+		invalidate_inode_pages2_range(pinned->i_mapping, 0, -1);
+		cond_resched();
+		spin_lock(&sb->s_inode_list_lock);
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+	iput(toput);
+}
+
+/* Drop all cached state in every mount. Called when the daemon disconnects: its
+ * successor's subscription resumes from "now", so anything that changed during
+ * the outage would otherwise be served stale forever. */
+static void swvfs_flush_all(void)
+{
+	struct swvfs_mount *m;
+
+	down_read(&swvfs_sb_sem);
+	list_for_each_entry(m, &swvfs_mounts, node)
+		swvfs_flush_sb(m->sb);
+	up_read(&swvfs_sb_sem);
+}
+
 static ssize_t swvfs_dev_write(struct file *f, const char __user *buf,
 			       size_t len, loff_t *off)
 {
@@ -329,6 +449,13 @@ static ssize_t swvfs_dev_write(struct file *f, const char __user *buf,
 		return -EINVAL;
 	if (copy_from_user(&hdr, buf, sizeof(hdr)))
 		return -EFAULT;
+
+	/* tag 0 is never a request tag (they start at 2): a daemon-pushed cache
+	 * invalidation for the inode in hdr.attr.ino, not a reply. */
+	if (hdr.tag == 0) {
+		swvfs_invalidate(hdr.attr.ino);
+		return len;
+	}
 
 	mutex_lock(&swvfs_lock);
 	list_for_each_entry(it, &swvfs_inflight, list) {
@@ -756,6 +883,11 @@ static int swvfs_dev_release(struct inode *inode, struct file *f)
 	mutex_unlock(&swvfs_lock);
 	if (d)
 		put_task_struct(d);
+	/* The daemon is gone and a successor's subscription resumes from "now", so
+	 * drop every mount's caches; anything changed during the outage re-fetches on
+	 * next access. Safe here: swvfs_connected is already false, so a racing read
+	 * fails fast (ENOTCONN) rather than blocking with a folio locked. */
+	swvfs_flush_all();
 	pr_info("seaweedvfs: daemon disconnected\n");
 	return 0;
 }
@@ -817,16 +949,23 @@ static void swvfs_apply_attr(struct inode *inode, const struct swvfs_attr *a)
 }
 
 /* Get-or-create an inode with the daemon-assigned (hashed) number. */
+/* `trust` says the attrs come from our own mutation (create/mkdir/mknod/symlink),
+ * so reinitialize even a reused inode and drop its page cache: a path-hashed ino
+ * can resolve to an unlink-while-open inode still cached at nlink 0 with stale
+ * size/mode/pages, and recreating the name must not inherit them. An untrusted
+ * reply (lookup/readdir) applies only to a fresh inode — re-stamping an existing
+ * one risks masking an invalidation the reply raced, so the generation-guarded
+ * getattr refreshes it instead. */
 static struct inode *swvfs_iget(struct super_block *sb,
-				const struct swvfs_attr *a)
+				const struct swvfs_attr *a, bool trust)
 {
 	struct inode *inode = iget_locked(sb, a->ino);
 
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 
-	swvfs_apply_attr(inode, a);
 	if (SWVFS_I_STATE(inode) & I_NEW) {
+		swvfs_apply_attr(inode, a);
 		if (S_ISDIR(inode->i_mode)) {
 			inode->i_op = &seaweedvfs_dir_inode_ops;
 			inode->i_fop = &seaweedvfs_dir_ops;
@@ -842,6 +981,9 @@ static struct inode *swvfs_iget(struct super_block *sb,
 			inode->i_mapping->a_ops = &seaweedvfs_aops;
 		}
 		unlock_new_inode(inode);
+	} else if (trust) {
+		swvfs_apply_attr(inode, a);
+		invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
 	}
 	return inode;
 }
@@ -1100,9 +1242,22 @@ static void seaweedvfs_readahead(struct readahead_control *rac)
 	kvfree(buf);
 }
 
+/* Snapshot the parent directory's namespace generation onto a child dentry (in
+ * d_fsdata), so d_revalidate can later tell whether the parent changed under it.
+ * Always pass the generation sampled BEFORE the upcall that confirmed the name
+ * (lookup, readdir, or a create/mkdir/... mutation): if an invalidation races the
+ * upcall and bumps the parent's generation first, the stale snapshot then fails
+ * d_revalidate and the name is re-resolved, instead of silently inheriting the
+ * bumped value and passing. */
+static void swvfs_stamp_dentry(struct dentry *dentry, unsigned int gen)
+{
+	dentry->d_fsdata = (void *)(unsigned long)gen;
+}
+
 /* readdirplus: instantiate the child dentry+inode with the attrs the daemon
  * already returned, so the follow-up lookup/getattr for `ls -l` hit the cache. */
-static void swvfs_prime_dcache(struct dentry *parent, struct swvfs_dirent *d)
+static void swvfs_prime_dcache(struct dentry *parent, struct swvfs_dirent *d,
+			       unsigned int gen)
 {
 	struct qstr name;
 	struct dentry *dentry, *alias;
@@ -1114,21 +1269,24 @@ static void swvfs_prime_dcache(struct dentry *parent, struct swvfs_dirent *d)
 
 	dentry = d_lookup(parent, &name);
 	if (dentry) {
-		if (d_really_is_positive(dentry) &&
-		    d_inode(dentry)->i_ino == d->attr.ino)
-			swvfs_apply_attr(d_inode(dentry), &d->attr);
+		/* Already cached. Don't re-stamp its attrs from this readdir
+		 * batch: the batch may predate a remote change whose invalidation
+		 * already landed, and re-stamping would mask it until the TTL.
+		 * A gen-guarded getattr refreshes it instead (seaweedvfs_getattr). */
 		dput(dentry);
 		return;
 	}
 	dentry = d_alloc(parent, &name);
 	if (!dentry)
 		return;
-	inode = swvfs_iget(parent->d_sb, &d->attr);
+	inode = swvfs_iget(parent->d_sb, &d->attr, false);
 	if (IS_ERR(inode)) {
 		dput(dentry);
 		return;
 	}
 	alias = d_splice_alias(inode, dentry);
+	if (!IS_ERR(alias))
+		swvfs_stamp_dentry(alias ? alias : dentry, gen);
 	if (!IS_ERR_OR_NULL(alias))
 		dput(alias);
 	dput(dentry);
@@ -1139,6 +1297,9 @@ static int seaweedvfs_readdir(struct file *file, struct dir_context *ctx)
 	struct dentry *parent = file->f_path.dentry;
 	char *pbuf, *dirpath;
 	int err = 0;
+	/* Snapshot the directory's namespace generation before the READDIR upcall(s),
+	 * to stamp the primed child dentries (see swvfs_prime_dcache). */
+	unsigned int gen = atomic_read(&SWVFS_I(d_inode(parent))->cache_gen);
 
 	if (!dir_emit_dots(file, ctx))
 		return 0;
@@ -1182,7 +1343,7 @@ static int seaweedvfs_readdir(struct file *file, struct dir_context *ctx)
 			struct swvfs_dirent *d = &r->dirents[i];
 			u32 nl = min_t(u32, d->namelen, SWVFS_NAME_MAX);
 
-			swvfs_prime_dcache(parent, d);
+			swvfs_prime_dcache(parent, d, gen);
 			if (!dir_emit(ctx, d->name, nl, d->attr.ino, d->type)) {
 				swvfs_free_req(r);
 				goto out;
@@ -1200,12 +1361,37 @@ out:
 	return err < 0 ? err : 0;
 }
 
+/* A child dentry is valid while its parent directory's namespace generation still
+ * matches the snapshot taken when the name was cached. A namespace change
+ * (create/delete/rename) bumps the parent's gen via swvfs_invalidate, so a stale
+ * name is re-resolved on next use — including a dentry still referenced by an open
+ * file or a concurrent lookup, which shrink_dcache cannot reclaim. The compare is
+ * lockless, so RCU-walk need not drop to ref-walk. */
+static int seaweedvfs_d_revalidate(SWVFS_D_REVALIDATE_ARGS)
+{
+	struct inode *pdir;
+
+	if (IS_ROOT(dentry))
+		return 1; /* the root always exists; no parent namespace to track */
+	pdir = SWVFS_REVAL_DIR(dentry);
+	if (!pdir)
+		return -ECHILD;
+	return (unsigned long)dentry->d_fsdata ==
+	       (unsigned long)atomic_read(&SWVFS_I(pdir)->cache_gen);
+}
+
+static const struct dentry_operations seaweedvfs_dentry_ops = {
+	.d_revalidate = seaweedvfs_d_revalidate,
+};
+
 static struct dentry *seaweedvfs_lookup(struct inode *dir,
 					struct dentry *dentry,
 					unsigned int flags)
 {
 	struct swvfs_request *r;
 	struct inode *inode = NULL;
+	struct dentry *res;
+	unsigned int gen;
 	int err;
 
 	if (dentry->d_name.len > SWVFS_NAME_MAX)
@@ -1215,9 +1401,13 @@ static struct dentry *seaweedvfs_lookup(struct inode *dir,
 	if (IS_ERR(r))
 		return ERR_CAST(r);
 
+	/* Sample the parent's namespace generation before the upcall; the resolved
+	 * dentry (positive or negative) is stamped with it, so an invalidation that
+	 * races this lookup makes d_revalidate re-resolve the name. */
+	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, false);
 		if (IS_ERR(inode)) {
 			err = PTR_ERR(inode);
 			inode = NULL;
@@ -1225,11 +1415,12 @@ static struct dentry *seaweedvfs_lookup(struct inode *dir,
 	}
 	swvfs_free_req(r);
 
-	if (err == -ENOENT)
-		return d_splice_alias(NULL, dentry);
-	if (err)
+	if (err && err != -ENOENT)
 		return ERR_PTR(err);
-	return d_splice_alias(inode, dentry);
+	res = d_splice_alias(inode, dentry); /* inode == NULL on ENOENT → negative */
+	if (!IS_ERR(res))
+		swvfs_stamp_dentry(res ? res : dentry, gen);
+	return res;
 }
 
 static int seaweedvfs_getattr(SWVFS_IDMAP idmap, const struct path *path,
@@ -1248,8 +1439,24 @@ static int seaweedvfs_getattr(SWVFS_IDMAP idmap, const struct path *path,
 			swvfs_req_from_dentry(SWVFS_OP_GETATTR, path->dentry);
 
 		if (!IS_ERR(r)) {
-			if (swvfs_send(r) == 0 && r->reply.attr.ino)
-				swvfs_apply_attr(inode, &r->reply.attr);
+			int gen = atomic_read(&SWVFS_I(inode)->cache_gen);
+			int err = swvfs_send(r);
+
+			if (err == 0 && r->reply.attr.ino) {
+				/* Drop the reply if an invalidation raced this
+				 * upcall: it may predate the change, and applying
+				 * it would re-stamp stale attrs as fresh. Leaving
+				 * i_private clear makes the next getattr re-fetch. */
+				if (atomic_read(&SWVFS_I(inode)->cache_gen) == gen)
+					swvfs_apply_attr(inode, &r->reply.attr);
+			} else if (err == -ENOENT) {
+				/* Removed on another client: stop serving the
+				 * cached inode. Drop the dentry so it re-resolves
+				 * to a negative, and report the entry gone. */
+				swvfs_free_req(r);
+				d_drop(path->dentry);
+				return -ENOENT;
+			}
 			swvfs_free_req(r);
 		}
 	}
@@ -1262,6 +1469,7 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 {
 	struct swvfs_request *r;
 	struct inode *inode;
+	unsigned int gen;
 	int err;
 
 	if (dentry->d_name.len > SWVFS_NAME_MAX)
@@ -1273,9 +1481,11 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 	r->req.uid = from_kuid(&init_user_ns, current_fsuid());
 	r->req.gid = from_kgid(&init_user_ns, current_fsgid());
 
+	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
+	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
 		if (IS_ERR(inode)) {
 			err = PTR_ERR(inode);
 		} else {
@@ -1289,6 +1499,7 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 			 * through 0, tripping WARN_ON in inc_nlink/drop_nlink.
 			 */
 			d_instantiate(dentry, inode);
+			swvfs_stamp_dentry(dentry, gen);
 		}
 	}
 	swvfs_free_req(r);
@@ -1301,6 +1512,33 @@ static int seaweedvfs_create(SWVFS_IDMAP idmap, struct inode *dir,
 	return swvfs_make(dir, dentry, mode, SWVFS_OP_CREATE);
 }
 
+/* Decline to open the file ourselves, but first resolve the name when the VFS
+ * handed us an unresolved (in-lookup) dentry. Because we provide ->atomic_open
+ * the VFS does NOT fall back to ->lookup for an open, so without this a plain
+ * open of a name not already in our dcache — e.g. a file another client just
+ * created — would be reported absent (the in-lookup dentry stays negative).
+ *
+ * `force` additionally re-resolves a *cached* negative dentry: the caller already
+ * learned the name exists on the filer (CREATE returned EEXIST), so the negative
+ * is stale even though its invalidation may not have arrived yet — without this,
+ * open(O_CREAT) without O_EXCL would wrongly return ENOENT. (lookup_open returns a
+ * cached positive before calling ->atomic_open, so the dentry here is only ever
+ * in-lookup or negative.) Drop the stale negative so it can be re-spliced. */
+static int swvfs_finish_no_open(struct inode *dir, struct dentry *dentry,
+				struct file *file, bool force)
+{
+	struct dentry *res = NULL;
+
+	if (force && !d_in_lookup(dentry))
+		d_drop(dentry);
+	if (force || d_in_lookup(dentry)) {
+		res = seaweedvfs_lookup(dir, dentry, 0);
+		if (IS_ERR(res))
+			return PTR_ERR(res);
+	}
+	return finish_no_open(file, res);
+}
+
 /* Combine create + open into a single upcall for open(O_CREAT). The VFS would
  * otherwise call ->lookup (a negative-LOOKUP upcall) before ->create; here we
  * try an exclusive CREATE directly and only fall back to the normal lookup+open
@@ -1311,11 +1549,14 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 {
 	struct swvfs_request *r;
 	struct inode *inode;
+	unsigned int gen;
 	int err;
 
-	/* Plain opens of existing files: let the VFS do its normal lookup+open. */
+	/* Plain (non-create) open: resolve and open the existing name (or report it
+	 * gone) — swvfs_finish_no_open does the lookup the VFS won't. A valid cached
+	 * negative is trusted here (no filer evidence to the contrary). */
 	if (!(open_flag & O_CREAT))
-		return finish_no_open(file, NULL);
+		return swvfs_finish_no_open(dir, dentry, file, false);
 	if (dentry->d_name.len > SWVFS_NAME_MAX)
 		return -ENAMETOOLONG;
 
@@ -1326,11 +1567,13 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 	r->req.uid = from_kuid(&init_user_ns, current_fsuid());
 	r->req.gid = from_kgid(&init_user_ns, current_fsgid());
 	r->req.valid = SWVFS_CREATE_EXCL; /* fail with EEXIST if it already exists */
+	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
+	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
 		struct dentry *alias = NULL;
 
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
 		swvfs_free_req(r);
 		if (IS_ERR(inode))
 			return PTR_ERR(inode);
@@ -1347,6 +1590,7 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 		} else {
 			d_instantiate(dentry, inode);
 		}
+		swvfs_stamp_dentry(dentry, gen);
 		file->f_mode |= FMODE_CREATED;
 		err = finish_open(file, dentry, NULL);
 		dput(alias);
@@ -1354,9 +1598,11 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 	}
 	swvfs_free_req(r);
 
-	/* Already exists: O_EXCL must fail; otherwise fall back to lookup+open. */
+	/* Already exists: O_EXCL must fail; otherwise resolve and open it. Force the
+	 * lookup — the filer just told us the name exists, so re-resolve even a cached
+	 * negative whose invalidation is still in flight (else we'd return ENOENT). */
 	if (err == -EEXIST && !(open_flag & O_EXCL))
-		return finish_no_open(file, NULL);
+		return swvfs_finish_no_open(dir, dentry, file, true);
 	return err;
 }
 
@@ -1375,6 +1621,7 @@ static int seaweedvfs_mknod(SWVFS_IDMAP idmap, struct inode *dir,
 {
 	struct swvfs_request *r;
 	struct inode *inode;
+	unsigned int gen;
 	int err;
 
 	if (!S_ISCHR(mode) && !S_ISBLK(mode) && !S_ISFIFO(mode) &&
@@ -1391,13 +1638,17 @@ static int seaweedvfs_mknod(SWVFS_IDMAP idmap, struct inode *dir,
 	r->req.uid = from_kuid(&init_user_ns, current_fsuid());
 	r->req.gid = from_kgid(&init_user_ns, current_fsgid());
 
+	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
+	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
 		if (IS_ERR(inode))
 			err = PTR_ERR(inode);
-		else
+		else {
 			d_instantiate(dentry, inode);
+			swvfs_stamp_dentry(dentry, gen);
+		}
 	}
 	swvfs_free_req(r);
 	return err;
@@ -1447,6 +1698,7 @@ static int seaweedvfs_setattr(SWVFS_IDMAP idmap, struct dentry *dentry,
 {
 	struct inode *inode = d_inode(dentry);
 	struct swvfs_request *r;
+	unsigned int gen;
 	int err;
 
 	err = setattr_prepare(idmap, dentry, iattr);
@@ -1483,8 +1735,16 @@ static int seaweedvfs_setattr(SWVFS_IDMAP idmap, struct dentry *dentry,
 		r->req.atime_nsec = iattr->ia_atime.tv_nsec;
 	}
 
+	/* Snapshot the generation before the RPC. If a remote invalidation races this
+	 * setattr, apply NONE of the local state — not truncate_setsize, not the reply
+	 * attrs, not setattr_copy. A concurrent remote write may have won on the filer
+	 * after our truncate, so the requested size is no longer authoritative;
+	 * installing it could make reads return premature EOF. The invalidation already
+	 * cleared i_private and dropped the page cache, so the next getattr/read
+	 * refreshes from the filer (the request itself still succeeded there). */
+	gen = atomic_read(&SWVFS_I(inode)->cache_gen);
 	err = swvfs_send(r);
-	if (err == 0) {
+	if (err == 0 && atomic_read(&SWVFS_I(inode)->cache_gen) == gen) {
 		if ((iattr->ia_valid & ATTR_SIZE) &&
 		    iattr->ia_size != i_size_read(inode))
 			truncate_setsize(inode, iattr->ia_size);
@@ -1504,6 +1764,7 @@ static int seaweedvfs_symlink(SWVFS_IDMAP idmap, struct inode *dir,
 	struct swvfs_request *r;
 	struct inode *inode;
 	char *buf, *path;
+	unsigned int gen;
 	int err;
 
 	if (dentry->d_name.len > SWVFS_NAME_MAX)
@@ -1524,13 +1785,17 @@ static int seaweedvfs_symlink(SWVFS_IDMAP idmap, struct inode *dir,
 	r->req.uid = from_kuid(&init_user_ns, current_fsuid());
 	r->req.gid = from_kgid(&init_user_ns, current_fsgid());
 
+	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
+	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
 		if (IS_ERR(inode))
 			err = PTR_ERR(inode);
-		else
+		else {
 			d_instantiate(dentry, inode);
+			swvfs_stamp_dentry(dentry, gen);
+		}
 	}
 	swvfs_free_req(r);
 	return err;
@@ -1643,6 +1908,7 @@ static int seaweedvfs_link(struct dentry *old_dentry, struct inode *dir,
 	struct inode *inode = d_inode(old_dentry);
 	struct swvfs_request *r;
 	char *obuf, *nbuf, *op, *np;
+	unsigned int gen;
 	int err;
 
 	if (new_dentry->d_name.len > SWVFS_NAME_MAX)
@@ -1670,6 +1936,8 @@ static int seaweedvfs_link(struct dentry *old_dentry, struct inode *dir,
 	if (!r)
 		return -ENOMEM;
 
+	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
+	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
 		if (r->reply.attr.nlink)
@@ -1679,6 +1947,7 @@ static int seaweedvfs_link(struct dentry *old_dentry, struct inode *dir,
 		inode_set_ctime_current(inode);
 		ihold(inode);
 		d_instantiate(new_dentry, inode);
+		swvfs_stamp_dentry(new_dentry, gen);
 	}
 	swvfs_free_req(r);
 	return err;
@@ -2117,7 +2386,33 @@ static int seaweedvfs_drop_inode(struct inode *inode)
 	return 1;
 }
 
+static struct inode *swvfs_alloc_inode(struct super_block *sb)
+{
+	struct swvfs_inode *si =
+		alloc_inode_sb(sb, swvfs_inode_cachep, GFP_KERNEL);
+
+	if (!si)
+		return NULL;
+	atomic_set(&si->cache_gen, 0);
+	return &si->vfs_inode;
+}
+
+/* RCU-deferred by the VFS; just return the object to its slab. */
+static void swvfs_free_inode(struct inode *inode)
+{
+	kmem_cache_free(swvfs_inode_cachep, SWVFS_I(inode));
+}
+
+/* Slab constructor: init only the embedded VFS inode (runs once per object, and
+ * must survive reuse); cache_gen is (re)set per allocation in swvfs_alloc_inode. */
+static void swvfs_inode_init_once(void *p)
+{
+	inode_init_once(&((struct swvfs_inode *)p)->vfs_inode);
+}
+
 static const struct super_operations seaweedvfs_super_ops = {
+	.alloc_inode = swvfs_alloc_inode,
+	.free_inode = swvfs_free_inode,
 	.statfs = seaweedvfs_statfs,
 	.drop_inode = seaweedvfs_drop_inode,
 };
@@ -2136,16 +2431,23 @@ static struct inode *swvfs_make_root(struct super_block *sb)
 	inode->i_op = &seaweedvfs_dir_inode_ops;
 	inode->i_fop = &seaweedvfs_dir_ops;
 	set_nlink(inode, 2);
+	/* Hash the root like every other inode so a daemon-pushed invalidation for a
+	 * root-level namespace change (ino == SEAWEEDVFS_ROOT_INO) can ilookup it;
+	 * new_inode() alone leaves it unhashed, so ilookup would miss it and a remote
+	 * create/delete/rename directly under "/" would never reach the cache. */
+	insert_inode_hash(inode);
 	return inode;
 }
 
 static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
+	struct swvfs_mount *m;
 	struct inode *root;
 	int err;
 
 	sb->s_magic = SEAWEEDVFS_MAGIC;
 	sb->s_op = &seaweedvfs_super_ops;
+	SWVFS_SET_DEFAULT_D_OP(sb, &seaweedvfs_dentry_ops); /* keys on parent gen */
 	/* s_xattr lost an inner const across versions; cast to its actual type. */
 	sb->s_xattr = (typeof(sb->s_xattr))seaweedvfs_xattr_handlers;
 	sb->s_blocksize = PAGE_SIZE;
@@ -2171,6 +2473,14 @@ static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	if (!sb->s_root)
 		return -ENOMEM;
 
+	m = kzalloc(sizeof(*m), GFP_KERNEL);
+	if (!m)
+		return -ENOMEM;
+	m->sb = sb;
+	sb->s_fs_info = m;
+	down_write(&swvfs_sb_sem);
+	list_add(&m->node, &swvfs_mounts);
+	up_write(&swvfs_sb_sem);
 	pr_info("seaweedvfs: mounted\n");
 	return 0;
 }
@@ -2194,6 +2504,17 @@ static int seaweedvfs_init_fs_context(struct fs_context *fc)
 
 static void seaweedvfs_kill_sb(struct super_block *sb)
 {
+	struct swvfs_mount *m = sb->s_fs_info;
+
+	/* Unlink under the write lock: it blocks until in-flight invalidations
+	 * (sem readers) finish, so none still references this sb when
+	 * kill_anon_super frees it below. */
+	down_write(&swvfs_sb_sem);
+	if (m)
+		list_del(&m->node);
+	up_write(&swvfs_sb_sem);
+	kfree(m);
+	sb->s_fs_info = NULL;
 	pr_info("seaweedvfs: unmounted\n");
 	kill_anon_super(sb);
 }
@@ -2210,16 +2531,26 @@ static int __init seaweedvfs_init(void)
 {
 	int err;
 
+	swvfs_inode_cachep = kmem_cache_create(
+		"seaweedvfs_inode", sizeof(struct swvfs_inode), 0,
+		SLAB_RECLAIM_ACCOUNT | SLAB_ACCOUNT, swvfs_inode_init_once);
+	if (!swvfs_inode_cachep) {
+		pr_err("seaweedvfs: inode cache create failed\n");
+		return -ENOMEM;
+	}
+
 	/* Unbound so read-ahead fetches run concurrently (matching the daemon). */
 	swvfs_ra_wq = alloc_workqueue("swvfs_ra", WQ_UNBOUND, 0);
 	if (!swvfs_ra_wq) {
 		pr_err("seaweedvfs: alloc_workqueue failed\n");
+		kmem_cache_destroy(swvfs_inode_cachep);
 		return -ENOMEM;
 	}
 	err = misc_register(&swvfs_miscdev);
 	if (err) {
 		pr_err("seaweedvfs: misc_register failed: %d\n", err);
 		destroy_workqueue(swvfs_ra_wq);
+		kmem_cache_destroy(swvfs_inode_cachep);
 		return err;
 	}
 	err = register_filesystem(&seaweedvfs_fs_type);
@@ -2227,6 +2558,7 @@ static int __init seaweedvfs_init(void)
 		pr_err("seaweedvfs: register_filesystem failed: %d\n", err);
 		misc_deregister(&swvfs_miscdev);
 		destroy_workqueue(swvfs_ra_wq);
+		kmem_cache_destroy(swvfs_inode_cachep);
 		return err;
 	}
 	pr_info("seaweedvfs: loaded (v%s); /dev/seaweedvfs ready\n",
@@ -2239,6 +2571,10 @@ static void __exit seaweedvfs_exit(void)
 	unregister_filesystem(&seaweedvfs_fs_type);
 	misc_deregister(&swvfs_miscdev);
 	destroy_workqueue(swvfs_ra_wq); /* drains any in-flight read-ahead */
+	/* free_inode returns inodes to the slab via RCU; wait for those callbacks
+	 * before destroying the cache they free into. */
+	rcu_barrier();
+	kmem_cache_destroy(swvfs_inode_cachep);
 	pr_info("seaweedvfs: unloaded\n");
 }
 

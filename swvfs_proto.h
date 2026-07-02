@@ -171,9 +171,14 @@ struct swvfs_statfs {
 	__u32 namelen; /* f_namelen */
 }; /* 48 bytes; STATFS returns this as the reply data payload */
 
+/* Daemon -> kernel messages reuse this struct. Normally it's a reply matched to
+ * an in-flight request by `tag` (always >= 2). A write with `tag == 0` is instead
+ * an unsolicited cache-invalidation push: `attr.ino` names the inode whose
+ * metadata/data changed on another client, so the kernel drops it from the attr
+ * and page caches. The daemon's metadata subscription emits these. */
 struct swvfs_reply {
 	__u64 tag;
-	struct swvfs_attr attr; /* LOOKUP/GETATTR result */
+	struct swvfs_attr attr; /* LOOKUP/GETATTR result; ino = target on a tag-0 push */
 	__s32 error; /* 0 ok, else -errno */
 	__u32 nentries; /* READDIR: entries that follow this header */
 	__u32 eof; /* READDIR: 1 if this batch reaches end of dir */
