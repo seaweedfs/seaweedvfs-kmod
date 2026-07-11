@@ -1,0 +1,112 @@
+name: sync kernel module from seaweed-mono
+
+# seaweed-mono is the source of truth for the kernel module
+# (seaweed-vfs/kernel/). This repo PULLS that tree on a schedule and opens a PR
+# here when it drifts. The branch and PR are created with this repo's own
+# GITHUB_TOKEN, so no cross-repo write/PR permission is required — that was the
+# failure mode of the old mono -> kmod push (a PAT that could push a branch but
+# not open a PR). Only READ access to the private mono is external.
+#
+# .github/ is intentionally NOT mirrored — this repo keeps its own CI config.
+#
+# Reuses the MONO_SYNC_TOKEN secret (the same PAT the manual sync-to-mono uses);
+# only its read access to the private seaweedfs/seaweed-mono is needed here.
+# Skips silently when the secret is absent.
+
+on:
+  schedule:
+    # Daily at 05:30 UTC (after the build-matrix nightly at 03:00)
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write       # push the sync branch on this repo
+  pull-requests: write  # open the PR on this repo
+  actions: write        # dispatch build-matrix to validate the sync branch
+
+jobs:
+  # Gate: emit configured=true only when the read token is present, so the sync
+  # job doesn't fail with an opaque "token required" error before it is added.
+  check-token:
+    runs-on: ubuntu-22.04
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        env:
+          TOKEN: ${{ secrets.MONO_SYNC_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "MONO_SYNC_TOKEN secret not set — skipping sync." >> "$GITHUB_STEP_SUMMARY"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  sync:
+    needs: check-token
+    if: needs.check-token.outputs.configured == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout seaweedvfs-kmod
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: kmod
+
+      - name: Checkout seaweed-mono kernel tree
+        uses: actions/checkout@v4
+        with:
+          repository: seaweedfs/seaweed-mono
+          token: ${{ secrets.MONO_SYNC_TOKEN }}
+          sparse-checkout: seaweed-vfs/kernel
+          fetch-depth: 1
+          path: mono
+
+      - name: Mirror module and open a PR
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Mirror the module tree (source of truth) onto this repo's root.
+          # Exclude .git and .github so kmod keeps its own history and CI config.
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/' \
+            mono/seaweed-vfs/kernel/ kmod/
+
+          cd kmod
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "kmod already in sync — nothing to do." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # A single long-lived auto branch, reset from main each run so the PR
+          # always shows a clean main -> current diff.
+          BRANCH="auto/sync-from-mono"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A
+          git commit -m "sync kernel module from seaweed-mono (auto)"
+          git push --force origin "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Reuse an open auto-sync PR if one exists; else open one (idempotent).
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "Sync kernel module from seaweed-mono" \
+              --body "Automated mirror of seaweed-mono \`seaweed-vfs/kernel/\` (the source of truth). Review and merge when the build matrix is green."
+          fi
+
+      - name: Validate the sync branch with the build matrix
+        if: steps.sync.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # A branch/PR created with GITHUB_TOKEN does not trigger pull_request
+          # or push CI (recursion guard), so kick the build matrix on the sync
+          # branch explicitly — it already exposes a workflow_dispatch trigger.
+          gh workflow run build-matrix.yml --ref "${{ steps.sync.outputs.branch }}"
