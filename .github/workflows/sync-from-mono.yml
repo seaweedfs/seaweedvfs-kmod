@@ -109,4 +109,4 @@ jobs:
           # A branch/PR created with GITHUB_TOKEN does not trigger pull_request
           # or push CI (recursion guard), so kick the build matrix on the sync
           # branch explicitly — it already exposes a workflow_dispatch trigger.
-          gh workflow run build-matrix.yml --ref "${{ steps.sync.outputs.branch }}"
+          gh workflow run build-matrix.yml --repo "${{ github.repository }}" --ref "${{ steps.sync.outputs.branch }}"
