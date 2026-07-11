@@ -129,8 +129,8 @@
 #endif
 
 /*
- * The recent VFS dentry rework changed two things this module touches. They
- * landed together upstream, but each gets its own feature probe (see
+ * The recent VFS dentry/lookup rework changed three things this module touches.
+ * They landed together upstream, but each gets its own feature probe (see
  * compat-probes/) rather than a LINUX_VERSION_CODE guard: these are struct-field
  * and symbol signatures a compile-test pins exactly, and ->d_revalidate-style fs
  * callbacks are the kind enterprise distros backport — where the version lies.
@@ -145,6 +145,13 @@
  *      [HAVE_D_REVALIDATE_DIR]
  *  (b) sb->s_d_op became private; the default dentry_operations are installed
  *      with set_default_d_op(sb, ops). [HAVE_SET_DEFAULT_D_OP]
+ *  (c) the no-perm single-component lookup helper (used by the NFS-export path
+ *      walker) was renamed and switched to a qstr:
+ *      lookup_one_len_unlocked(name, base, len) ->
+ *      lookup_noperm_unlocked(&QSTR(name), base). [HAVE_LOOKUP_NOPERM]
+ *
+ * SWVFS_LOOKUP_COMPONENT evaluates `name` more than once (strlen), so pass a
+ * plain variable with no side effects.
  */
 #ifdef HAVE_D_REVALIDATE_DIR
 # define SWVFS_D_REVALIDATE_ARGS \
@@ -160,6 +167,14 @@
 # define SWVFS_SET_DEFAULT_D_OP(sb, ops)  set_default_d_op((sb), (ops))
 #else
 # define SWVFS_SET_DEFAULT_D_OP(sb, ops)  ((sb)->s_d_op = (ops))
+#endif
+
+#ifdef HAVE_LOOKUP_NOPERM
+# define SWVFS_LOOKUP_COMPONENT(name, base) \
+	lookup_noperm_unlocked(&QSTR(name), (base))
+#else
+# define SWVFS_LOOKUP_COMPONENT(name, base) \
+	lookup_one_len_unlocked((name), (base), strlen(name))
 #endif
 
 /*
