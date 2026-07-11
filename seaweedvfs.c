@@ -23,6 +23,7 @@
 #include <linux/cred.h>
 #include <linux/dcache.h>
 #include <linux/delay.h>
+#include <linux/exportfs.h>	/* struct export_operations (NFS export) */
 #if __has_include(<linux/filelock.h>)
 #include <linux/filelock.h>	/* split out of fs.h in 6.5; absent on older LTS */
 #endif
@@ -35,6 +36,7 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/namei.h>	/* lookup_one_len_unlocked / lookup_noperm_unlocked */
 #include <linux/rcupdate.h>	/* rcu_barrier() before kmem_cache_destroy in exit */
 #include <linux/sched.h>
 #include <linux/sched/task.h>
@@ -320,14 +322,16 @@ static ssize_t swvfs_dev_read(struct file *f, char __user *buf, size_t len,
 	r->on_pending = false;
 	list_add_tail(&r->list, &swvfs_inflight);
 	r->on_inflight = true;
+	kref_get(&r->refcount); /* pin across the lockless copy_to_user below */
+	mutex_unlock(&swvfs_lock);
 
 	/*
-	 * Keep swvfs_lock held across copy_to_user. It can sleep (page fault),
-	 * and dropping the lock here would let swvfs_send() time out / be
-	 * signalled, remove r, and let its caller free r while we still
-	 * dereference it -> use-after-free. The mutex is sleepable, so holding
-	 * it across the copy is fine; the daemon's read buffer is anonymous
-	 * memory, so a fault while holding the lock cannot recurse into us.
+	 * Copy with swvfs_lock DROPPED. It can sleep (page fault), and if the
+	 * daemon's read buffer is a private (COW) mapping of a file on this same
+	 * mount, the fault recurses into read_folio -> swvfs_submit ->
+	 * mutex_lock(&swvfs_lock) and self-deadlocks. The kref keeps r alive even
+	 * if swvfs_send() times out and its caller returns meanwhile (the free is
+	 * deferred to swvfs_req_release). Mirrors __swvfs_deliver (the ring path).
 	 */
 	total = sizeof(r->req) + r->payload_len;
 	if (len < total)
@@ -337,10 +341,11 @@ static ssize_t swvfs_dev_read(struct file *f, char __user *buf, size_t len,
 	if (r->payload_len &&
 	    copy_to_user(buf + sizeof(r->req), r->payload, r->payload_len))
 		goto efault;
-	mutex_unlock(&swvfs_lock);
+	kref_put(&r->refcount, swvfs_req_release);
 	return total;
 
 efault:
+	mutex_lock(&swvfs_lock);
 	if (r->on_inflight && !r->answered) {
 		list_del_init(&r->list);
 		r->on_inflight = false;
@@ -349,6 +354,7 @@ efault:
 		complete(&r->done);
 	}
 	mutex_unlock(&swvfs_lock);
+	kref_put(&r->refcount, swvfs_req_release);
 	return -EFAULT;
 }
 
@@ -468,6 +474,17 @@ static ssize_t swvfs_dev_write(struct file *f, const char __user *buf,
 		mutex_unlock(&swvfs_lock);
 		return -ESRCH;
 	}
+	/* Claim r off inflight and pin it, then DROP the lock before the data
+	 * copy: copy_from_user may fault, and if the daemon's source buffer is a
+	 * private (COW) mapping of a file on this same mount, the fault recurses
+	 * into read_folio -> swvfs_submit -> mutex_lock(&swvfs_lock) and
+	 * self-deadlocks the whole filesystem. Mirrors swvfs_commit_ingest (the
+	 * ring path); a concurrent swvfs_wait() timeout can't also handle r once
+	 * it is off the list, and the kref keeps it alive across the copy. */
+	list_del_init(&r->list);
+	r->on_inflight = false;
+	kref_get(&r->refcount);
+	mutex_unlock(&swvfs_lock);
 
 	r->reply = hdr;
 	if (hdr.error == 0 && r->req.op == SWVFS_OP_READDIR && hdr.nentries > 0) {
@@ -502,11 +519,13 @@ static ssize_t swvfs_dev_write(struct file *f, const char __user *buf,
 		}
 	}
 
-	list_del_init(&r->list);
-	r->on_inflight = false;
-	r->answered = true;
-	complete(&r->done);
+	mutex_lock(&swvfs_lock);
+	if (!r->answered) {
+		r->answered = true;
+		complete(&r->done);
+	}
 	mutex_unlock(&swvfs_lock);
+	kref_put(&r->refcount, swvfs_req_release);
 	return len;
 }
 
@@ -679,13 +698,21 @@ static void swvfs_commit_cb(struct io_uring_cmd *cmd, unsigned int issue_flags)
 	struct swvfs_slot *s = &swvfs_slots[pdu->slot];
 
 	if (current != swvfs_daemon || (current->flags & PF_EXITING)) {
+		/* Complete cmd ONLY if we still hold the claim: the cancel walk
+		 * (swvfs_uring_cancel) races this task_work on teardown and may
+		 * have already claimed and completed cmd. A second io_uring_cmd_done
+		 * on the recycled cmd is a UAF/double-CQE. Mirror the claim token
+		 * honored by __swvfs_deliver / swvfs_uring_cancel. */
+		bool claimed;
 		mutex_lock(&swvfs_lock);
-		if (s->cmd == cmd) {
+		claimed = s->cmd == cmd;
+		if (claimed) {
 			s->cmd = NULL;
 			s->scheduled = false;
 		}
 		mutex_unlock(&swvfs_lock);
-		io_uring_cmd_done(cmd, -ENODEV, 0, issue_flags);
+		if (claimed)
+			io_uring_cmd_done(cmd, -ENODEV, 0, issue_flags);
 		return;
 	}
 	swvfs_commit_ingest(pdu); /* deliver the reply to its inflight request */
@@ -929,9 +956,20 @@ static void swvfs_apply_attr(struct inode *inode, const struct swvfs_attr *a)
 	i_uid_write(inode, a->uid);
 	i_gid_write(inode, a->gid);
 	set_nlink(inode, a->nlink ? a->nlink : 1);
-	/* a->rdev is the portable new_encode_dev() form (matching FUSE/SeaweedFS
-	 * on-disk layout); decode it into a kernel dev_t. */
-	inode->i_rdev = new_decode_dev(a->rdev);
+	if (S_ISDIR(a->mode)) {
+		/* For directories rdev carries the daemon's 32-bit GENERATION
+		 * (a fold of the filer's stored per-entry inode: preserved across
+		 * renames, fresh on recreate). It lands in the standard
+		 * i_generation — same width mainstream NFS-exported filesystems
+		 * use — and from there into directory handles, so a recreated
+		 * directory no longer satisfies a stale handle. 0 = unknown. */
+		inode->i_generation = a->rdev;
+		inode->i_rdev = 0;
+	} else {
+		/* a->rdev is the portable new_encode_dev() form (matching
+		 * FUSE/SeaweedFS on-disk layout); decode into a kernel dev_t. */
+		inode->i_rdev = new_decode_dev(a->rdev);
+	}
 	i_size_write(inode, a->size);
 	SWVFS_INODE_SET_MTIME(inode, a->mtime_sec, a->mtime_nsec);
 	inode_set_ctime(inode, a->ctime_sec, a->ctime_nsec);
@@ -988,9 +1026,12 @@ static struct inode *swvfs_iget(struct super_block *sb,
 	return inode;
 }
 
-/* Build one READ sub-request for [off, off+seg). */
+/* Build one READ sub-request for [off, off+seg). `ino` is the identity the
+ * caller expects at `path`: the daemon refuses (ESTALE) when the path meanwhile
+ * names a different object (remote delete+recreate, stale NFS handle), so a
+ * read can never return another file's data. */
 static struct swvfs_request *swvfs_make_read(const char *path, size_t plen,
-					     loff_t off, size_t seg)
+					     u64 ino, loff_t off, size_t seg)
 {
 	struct swvfs_request *r =
 		swvfs_make_req(SWVFS_OP_READ, path, plen, NULL, 0, NULL, 0);
@@ -1005,6 +1046,7 @@ static struct swvfs_request *swvfs_make_read(const char *path, size_t plen,
 	r->max_data = seg;
 	r->req.offset = off;
 	r->req.size = seg;
+	r->req.expected_ino = ino;
 	return r;
 }
 
@@ -1024,8 +1066,8 @@ static void swvfs_read_copy(char *dst, size_t seg_off, size_t seg,
  * chunks; short reads are zero-filled. A multi-chunk read submits all its
  * chunks at once so the concurrent daemon fetches them in parallel — a single
  * sequential reader then approaches the multi-stream aggregate. */
-static int swvfs_read_into(const char *path, size_t plen, loff_t off, char *dst,
-			   size_t len)
+static int swvfs_read_into(const char *path, size_t plen, u64 ino, loff_t off,
+			   char *dst, size_t len)
 {
 	size_t nseg, i;
 	struct swvfs_request **reqs;
@@ -1037,7 +1079,8 @@ static int swvfs_read_into(const char *path, size_t plen, loff_t off, char *dst,
 	nseg = (len + SWVFS_READAHEAD_MAX - 1) / SWVFS_READAHEAD_MAX;
 
 	if (nseg == 1) {
-		struct swvfs_request *r = swvfs_make_read(path, plen, off, len);
+		struct swvfs_request *r = swvfs_make_read(path, plen, ino, off,
+							  len);
 
 		if (!r)
 			return -ENOMEM;
@@ -1056,7 +1099,7 @@ static int swvfs_read_into(const char *path, size_t plen, loff_t off, char *dst,
 	for (i = 0; i < nseg; i++) {
 		size_t seg_off = i * SWVFS_READAHEAD_MAX;
 		size_t seg = min_t(size_t, len - seg_off, SWVFS_READAHEAD_MAX);
-		struct swvfs_request *r = swvfs_make_read(path, plen,
+		struct swvfs_request *r = swvfs_make_read(path, plen, ino,
 							  off + seg_off, seg);
 
 		if (!r) {
@@ -1110,7 +1153,9 @@ static int seaweedvfs_read_folio(struct file *file, struct folio *folio)
 		return PTR_ERR(path);
 	}
 	buf = kvmalloc(len, GFP_KERNEL);
-	err = buf ? swvfs_read_into(path, strlen(path), folio_pos(folio), buf, len)
+	err = buf ? swvfs_read_into(path, strlen(path),
+				    folio->mapping->host->i_ino,
+				    folio_pos(folio), buf, len)
 		  : -ENOMEM;
 	if (!err)
 		SWVFS_MEMCPY_TO_FOLIO(folio, 0, buf, len);
@@ -1146,6 +1191,7 @@ static void swvfs_ra_fill_folio(struct folio *folio, const char *buf,
 struct swvfs_ra_work {
 	struct work_struct work;
 	char *path;
+	u64 ino; /* expected identity at path (see swvfs_make_read) */
 	loff_t start;
 	size_t total;
 	unsigned int nr;
@@ -1156,8 +1202,8 @@ static void swvfs_ra_worker(struct work_struct *w)
 {
 	struct swvfs_ra_work *r = container_of(w, struct swvfs_ra_work, work);
 	char *buf = kvmalloc(r->total, GFP_KERNEL);
-	int err = buf ? swvfs_read_into(r->path, strlen(r->path), r->start, buf,
-					r->total)
+	int err = buf ? swvfs_read_into(r->path, strlen(r->path), r->ino,
+					r->start, buf, r->total)
 		      : -ENOMEM;
 	unsigned int i;
 
@@ -1197,6 +1243,7 @@ static bool swvfs_try_async_readahead(struct readahead_control *rac, loff_t star
 		kfree(r);
 		return false;
 	}
+	r->ino = rac->mapping->host->i_ino;
 	r->start = start;
 	r->total = total;
 	while (i < count && (folio = __readahead_folio(rac)) != NULL)
@@ -1230,6 +1277,7 @@ static void seaweedvfs_readahead(struct readahead_control *rac)
 			if (!IS_ERR(path)) {
 				buf = kvmalloc(total, GFP_KERNEL);
 				err = buf ? swvfs_read_into(path, strlen(path),
+							    rac->mapping->host->i_ino,
 							    start, buf, total)
 					  : -ENOMEM;
 			}
@@ -1440,7 +1488,27 @@ static int seaweedvfs_getattr(SWVFS_IDMAP idmap, const struct path *path,
 
 		if (!IS_ERR(r)) {
 			int gen = atomic_read(&SWVFS_I(inode)->cache_gen);
-			int err = swvfs_send(r);
+			int err;
+
+			/* The identity this stat targets, AND its type. The daemon
+			 * must know the type the handle expected — not infer it from
+			 * whatever now sits at the path — or a file crafted with
+			 * inode == the old directory generation could satisfy a
+			 * directory handle. So mode carries it: 1 = file (identity is
+			 * i_ino), 2 = directory (identity is the generation, since a
+			 * directory's path-hash i_ino moves on rename). The daemon
+			 * rejects a type change, then compares identity, returning
+			 * -ESTALE on a mismatch. mode 0 = an older kernel that sent no
+			 * type (the daemon then infers, as before). Mirrors
+			 * READ/WRITE/SETATTR (files) and fh_to_dentry (directories). */
+			if (S_ISDIR(inode->i_mode)) {
+				r->req.mode = SWVFS_GETATTR_DIR;
+				r->req.expected_ino = inode->i_generation;
+			} else {
+				r->req.mode = SWVFS_GETATTR_FILE;
+				r->req.expected_ino = inode->i_ino;
+			}
+			err = swvfs_send(r);
 
 			if (err == 0 && r->reply.attr.ino) {
 				/* Drop the reply if an invalidation raced this
@@ -1449,14 +1517,26 @@ static int seaweedvfs_getattr(SWVFS_IDMAP idmap, const struct path *path,
 				 * i_private clear makes the next getattr re-fetch. */
 				if (atomic_read(&SWVFS_I(inode)->cache_gen) == gen)
 					swvfs_apply_attr(inode, &r->reply.attr);
-			} else if (err == -ENOENT) {
-				/* Removed on another client: stop serving the
-				 * cached inode. Drop the dentry so it re-resolves
-				 * to a negative, and report the entry gone. */
+			} else if (err == -ENOENT || err == -ESTALE) {
+				/* Removed on another client (ENOENT), or the path
+				 * now names a different object (ESTALE, from the
+				 * expected_ino check): stop serving the cached
+				 * inode. Drop the dentry so it re-resolves, and
+				 * report the error instead of stale attrs. */
 				swvfs_free_req(r);
 				d_drop(path->dentry);
-				return -ENOENT;
+				return err;
 			}
+			/* Any OTHER upcall failure — a transient RPC timeout
+			 * (-ETIMEDOUT), a brief daemon reconnect (-ENOTCONN),
+			 * -EINTR, or an -EIO from a failed identity re-lookup —
+			 * degrades to the cached attrs below rather than failing
+			 * the stat(): the same bounded-staleness the coherence
+			 * window already accepts (a recreated object is caught by
+			 * ESTALE above or by the invalidation push), and it keeps
+			 * `ls -l` from erroring mid-directory on a momentary hiccup.
+			 * Only a DEFINITE identity/existence error (handled above)
+			 * refuses to serve the cache. */
 			swvfs_free_req(r);
 		}
 	}
@@ -1735,6 +1815,12 @@ static int seaweedvfs_setattr(SWVFS_IDMAP idmap, struct dentry *dentry,
 		r->req.atime_nsec = iattr->ia_atime.tv_nsec;
 	}
 
+	/* The identity this attr change targets: the daemon refuses (ESTALE) if the
+	 * path meanwhile names a different object, so a stale NFS truncate/chmod (or
+	 * the suid-strip file_remove_privs runs before a WRITE) can't mutate a
+	 * recreated file. Mirrors the WRITE/READ expected_ino stamp. */
+	r->req.expected_ino = inode->i_ino;
+
 	/* Snapshot the generation before the RPC. If a remote invalidation races this
 	 * setattr, apply NONE of the local state — not truncate_setsize, not the reply
 	 * attrs, not setattr_copy. A concurrent remote write may have won on the filer
@@ -1936,6 +2022,11 @@ static int seaweedvfs_link(struct dentry *old_dentry, struct inode *dir,
 	if (!r)
 		return -ENOMEM;
 
+	/* The source object this link must attach to (a hard link is always a
+	 * file). The daemon refuses if `op` meanwhile names a different object, so
+	 * a stale dentry can't link the new name onto a recreated file. */
+	r->req.expected_ino = inode->i_ino;
+
 	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
 	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
@@ -2011,6 +2102,10 @@ static ssize_t seaweedvfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 			break;
 		}
 		r->req.offset = pos;
+		/* The identity this writer holds open: the daemon refuses (ESTALE)
+		 * if the path meanwhile names a different object, so a stale NFS
+		 * handle or pre-invalidation dentry can't modify a recreated file. */
+		r->req.expected_ino = inode->i_ino;
 		err = swvfs_send(r);
 		swvfs_free_req(r);
 		if (err)
@@ -2178,6 +2273,17 @@ static int seaweedvfs_xattr_get(const struct xattr_handler *handler,
 	}
 	r->max_data = XATTR_SIZE_MAX;
 
+	/* Read the xattr of the object this handle names, not whatever now sits at
+	 * the path: a stale handle must not disclose a recreated object's xattrs
+	 * (incl. security.*). Files by inode, directories by generation (flagged by
+	 * EXPECT_DIR, as for setxattr). The daemon returns -ESTALE on a mismatch. */
+	if (S_ISDIR(inode->i_mode)) {
+		r->req.valid |= SWVFS_EXPECT_DIR;
+		r->req.expected_ino = inode->i_generation;
+	} else {
+		r->req.expected_ino = inode->i_ino;
+	}
+
 	err = swvfs_send(r);
 	if (err) {
 		swvfs_free_req(r);
@@ -2223,6 +2329,18 @@ static int seaweedvfs_xattr_set(const struct xattr_handler *handler,
 		return -ENOMEM;
 	r->req.mode = flags;
 	r->req.valid = remove ? SWVFS_XATTR_REMOVE : 0;
+	/* The object this xattr targets: a file by inode, or a directory by its
+	 * GENERATION (its path-hash inode moves on rename). req.mode is taken by
+	 * the xattr flags, so the SWVFS_EXPECT_DIR valid bit tells the daemon which
+	 * expected_ino carries. The daemon refuses (-ESTALE) if the path meanwhile
+	 * names a different object, so a stale handle can't set an xattr on a
+	 * recreated file OR directory. */
+	if (S_ISDIR(inode->i_mode)) {
+		r->req.valid |= SWVFS_EXPECT_DIR;
+		r->req.expected_ino = inode->i_generation;
+	} else {
+		r->req.expected_ino = inode->i_ino;
+	}
 	err = swvfs_send(r);
 	swvfs_free_req(r);
 	return err;
@@ -2244,6 +2362,15 @@ static ssize_t seaweedvfs_listxattr(struct dentry *dentry, char *buffer,
 		return -ENOMEM;
 	}
 	r->max_data = XATTR_LIST_MAX;
+
+	/* List the xattrs of the object this handle names (see xattr_get): a stale
+	 * handle must not disclose a recreated object's xattr keys. */
+	if (S_ISDIR(d_inode(dentry)->i_mode)) {
+		r->req.valid |= SWVFS_EXPECT_DIR;
+		r->req.expected_ino = d_inode(dentry)->i_generation;
+	} else {
+		r->req.expected_ino = d_inode(dentry)->i_ino;
+	}
 
 	err = swvfs_send(r);
 	if (err) {
@@ -2439,6 +2566,268 @@ static struct inode *swvfs_make_root(struct super_block *sb)
 	return inode;
 }
 
+/*
+ * NFS export (docs/nfs-stale-inode.md). The filesystem is path-addressed, so a
+ * handle can't be a bare inode number — it carries the inode *and* the path:
+ * [u64 inode][NUL-terminated path], with the file/dir kind in the fid_type. The
+ * kernel side stays thin: walk the encoded path and check the inode; when that
+ * fails (the object was renamed), ask the daemon for the verified current path
+ * (SWVFS_OP_RESOLVE, served from its forwarding index) and walk that instead.
+ * Both the daemon (verify-before-answer) and the kernel (re-check after the
+ * walk) gate on the stored inode, so a reused path can never resolve to the
+ * wrong object — every edge degrades to ESTALE.
+ *
+ * A directory's inode is a path hash, so a directory handle accepts any
+ * directory at the resolved path (a recreate is indistinguishable); the export
+ * is experimental until directories carry a stored inode + generation.
+ */
+#define SWVFS_FILEID_PATH 0xF1	   /* file handle: inode (u64) + NUL-term path */
+#define SWVFS_FILEID_PATH_DIR 0xF2 /* legacy dir handle: path-hash in the slot */
+/* Directory handle with the GENERATION in the u64 slot (the path hash that
+ * 0xF2 stored there is redundant — recomputable from the encoded path). Legacy
+ * 0xF2 handles issued before the upgrade keep resolving with their original
+ * accept-any-directory semantics (gen 0 = don't check). */
+#define SWVFS_FILEID_PATH_DIR_GEN 0xF3
+
+static int seaweedvfs_encode_fh(struct inode *inode, __u32 *fh, int *max_len,
+				struct inode *parent)
+{
+	u64 ino = inode->i_ino;
+	struct dentry *dentry;
+	char *buf, *path;
+	int plen, words, ret = FILEID_INVALID;
+
+	/* Need a *connected* alias so the path is rooted at the mount and will
+	 * round-trip through fh_to_dentry; any such alias resolves to this inode
+	 * (hard links share it). d_find_alias skips disconnected/unhashed aliases;
+	 * none => nothing encodable, which is the honest answer. */
+	dentry = d_find_alias(inode);
+	if (!dentry)
+		return FILEID_INVALID;
+
+	buf = kmalloc(SWVFS_PATH_MAX, GFP_KERNEL);
+	if (!buf) {
+		dput(dentry);
+		return FILEID_INVALID;
+	}
+	path = dentry_path_raw(dentry, buf, SWVFS_PATH_MAX);
+	if (IS_ERR(path))
+		goto out;
+
+	/* Handle layout: one u64 (a file's inode number; a directory's
+	 * generation — its path-hash inode moves with renames and is
+	 * recomputable from the path anyway), then the NUL-terminated path. */
+	if (S_ISDIR(inode->i_mode))
+		ino = inode->i_generation;
+	plen = strlen(path) + 1;	/* keep the NUL so decode stays bounded */
+	words = DIV_ROUND_UP(sizeof(ino) + plen, sizeof(__u32));
+	if (words > *max_len) {
+		*max_len = words;	/* report the space we need; stay INVALID */
+		goto out;
+	}
+	fh[words - 1] = 0;		/* zero the trailing pad deterministically */
+	memcpy(fh, &ino, sizeof(ino));
+	memcpy((char *)fh + sizeof(ino), path, plen);
+	*max_len = words;
+	ret = S_ISDIR(inode->i_mode) ? SWVFS_FILEID_PATH_DIR_GEN : SWVFS_FILEID_PATH;
+out:
+	kfree(buf);
+	dput(dentry);
+	return ret;
+}
+
+/* Walk an FS-relative path from the mount root to a connected dentry, driving
+ * the normal per-component ->lookup (one daemon upcall each when uncached). The
+ * buffer is consumed in place by strsep(). Returns a ref'd dentry, or
+ * ERR_PTR(-ESTALE) when a component is missing or a non-directory appears
+ * mid-path. "/" (or "") resolves to the mount root. */
+static struct dentry *swvfs_path_to_dentry(struct super_block *sb, char *path)
+{
+	struct dentry *parent = dget(sb->s_root);
+	char *p = path, *name;
+
+	while ((name = strsep(&p, "/")) != NULL) {
+		struct dentry *child;
+
+		if (!*name)
+			continue;	/* skip empties from leading/dup/trailing '/' */
+		if (!d_can_lookup(parent)) {
+			dput(parent);
+			return ERR_PTR(-ESTALE);
+		}
+		child = SWVFS_LOOKUP_COMPONENT(name, parent);
+		dput(parent);
+		if (IS_ERR(child))
+			return child;
+		if (d_is_negative(child)) {
+			dput(child);
+			return ERR_PTR(-ESTALE);
+		}
+		parent = child;
+	}
+	return parent;
+}
+
+/* Decode the (client-controlled) handle into *ino, *is_dir, and a
+ * NUL-terminated, bounded path buffer (kmalloc'd). The length checks matter:
+ * fh_len comes off the wire, and struct fid lives in a knfsd_fh capped at
+ * MAX_HANDLE_SZ — an unchecked read past it is an out-of-bounds access. NULL on
+ * a handle we don't recognise (-> ESTALE), ERR_PTR on OOM. */
+static char *swvfs_fh_decode(struct fid *fid, int fh_len, int fh_type, u64 *ino,
+			     bool *is_dir)
+{
+	size_t nbytes, plen;
+	char *path;
+
+	if (fh_type != SWVFS_FILEID_PATH && fh_type != SWVFS_FILEID_PATH_DIR &&
+	    fh_type != SWVFS_FILEID_PATH_DIR_GEN)
+		return NULL;
+	if (fh_len <= 0 || fh_len > MAX_HANDLE_SZ / (int)sizeof(__u32))
+		return NULL;
+	*is_dir = (fh_type != SWVFS_FILEID_PATH);
+	nbytes = (size_t)fh_len * sizeof(__u32);
+	if (nbytes <= sizeof(*ino))
+		return NULL;	/* need the u64 plus at least one path byte */
+	memcpy(ino, fid->raw, sizeof(*ino));
+	/* A legacy dir handle's slot holds the (redundant) path hash, not a
+	 * generation: zero it so every check downgrades to accept-any-dir. */
+	if (fh_type == SWVFS_FILEID_PATH_DIR)
+		*ino = 0;
+	plen = nbytes - sizeof(*ino);
+	path = kmalloc(plen + 1, GFP_KERNEL);
+	if (!path)
+		return ERR_PTR(-ENOMEM);
+	memcpy(path, (char *)fid->raw + sizeof(*ino), plen);
+	path[plen] = '\0';	/* force-terminate: the bytes are untrusted */
+	return path;
+}
+
+/* Walk `path` and accept the dentry it lands on. A file handle must match its
+ * inode exactly, so a directory (or a recreated file) squatting the old path
+ * can't satisfy it — it falls through to the daemon resolve instead. For a
+ * directory handle `ino` carries the GENERATION (0 = legacy handle: accept any
+ * directory, the semantics it was issued under); a recreated directory has a
+ * fresh generation and falls through to the daemon resolve, which then also
+ * fails it — never the wrong directory. `path` is consumed in place. Returns a
+ * ref'd dentry or ERR_PTR(-ESTALE). */
+static struct dentry *swvfs_walk_verify(struct super_block *sb, char *path,
+					u64 ino, bool is_dir)
+{
+	struct dentry *d = swvfs_path_to_dentry(sb, path);
+	bool ok;
+
+	if (IS_ERR(d))
+		return d;
+	if (is_dir)
+		ok = d_is_dir(d) &&
+		     (ino == 0 || d_inode(d)->i_generation == (u32)ino);
+	else
+		ok = d_inode(d)->i_ino == ino;
+	if (ok)
+		return d;
+	dput(d);
+	return ERR_PTR(-ESTALE);
+}
+
+/* Ask the daemon for the verified current path of a renamed handle (it expands
+ * its forwarding index / directory-move redirects and verifies against the
+ * filer before answering). Returns a kmalloc'd NUL-terminated path, or NULL if
+ * the daemon can't resolve it. */
+static char *swvfs_resolve_upcall(u64 ino, bool is_dir, const char *encoded)
+{
+	struct swvfs_request *r = swvfs_make_req(SWVFS_OP_RESOLVE, encoded,
+						 strlen(encoded), NULL, 0,
+						 NULL, 0);
+	char *path = NULL;
+
+	if (!r)
+		return NULL;
+	r->req.offset = ino;
+	r->req.mode = is_dir ? 1 : 0;
+	r->data = kmalloc(SWVFS_PATH_MAX, GFP_KERNEL);
+	if (!r->data) {
+		swvfs_free_req(r);
+		return NULL;
+	}
+	r->max_data = SWVFS_PATH_MAX;
+	if (swvfs_send(r) == 0 && r->reply.datalen > 0 &&
+	    r->reply.datalen < SWVFS_PATH_MAX) {
+		path = kmalloc(r->reply.datalen + 1, GFP_KERNEL);
+		if (path) {
+			memcpy(path, r->data, r->reply.datalen);
+			path[r->reply.datalen] = '\0';
+		}
+	}
+	swvfs_free_req(r);
+	return path;
+}
+
+static struct dentry *seaweedvfs_fh_to_dentry(struct super_block *sb,
+					      struct fid *fid, int fh_len,
+					      int fh_type)
+{
+	u64 ino;
+	bool is_dir;
+	char *path = swvfs_fh_decode(fid, fh_len, fh_type, &ino, &is_dir);
+	struct dentry *res;
+	char *cur;
+
+	if (IS_ERR_OR_NULL(path))
+		return ERR_CAST(path);	/* NULL -> knfsd reports ESTALE */
+	res = swvfs_walk_verify(sb, path, ino, is_dir); /* consumes path's bytes */
+	if (IS_ERR(res)) {
+		/* Renamed? The daemon resolves the handle's ORIGINAL path (the
+		 * walk above strsep-mutated our copy, so re-derive it from the
+		 * wire bytes) through its forwarding index. */
+		kfree(path);
+		path = swvfs_fh_decode(fid, fh_len, fh_type, &ino, &is_dir);
+		if (IS_ERR_OR_NULL(path))
+			return ERR_CAST(path);
+		cur = swvfs_resolve_upcall(ino, is_dir, path);
+		if (cur) {
+			res = swvfs_walk_verify(sb, cur, ino, is_dir);
+			kfree(cur);
+		}
+	}
+	kfree(path);
+	return IS_ERR(res) ? ERR_PTR(-ESTALE) : res;
+}
+
+static struct dentry *seaweedvfs_fh_to_parent(struct super_block *sb,
+					      struct fid *fid, int fh_len,
+					      int fh_type)
+{
+	/* Resolve the (possibly renamed) child, then take its parent from the
+	 * dcache — the walk connected every component, so d_parent is the real
+	 * current parent, not a guess derived from the stale encoded path. */
+	struct dentry *child = seaweedvfs_fh_to_dentry(sb, fid, fh_len, fh_type);
+	struct dentry *parent;
+
+	if (IS_ERR_OR_NULL(child))
+		return child;
+	parent = dget_parent(child);
+	dput(child);
+	return parent;
+}
+
+static const struct export_operations seaweedvfs_export_ops = {
+	.encode_fh = seaweedvfs_encode_fh,
+	.fh_to_dentry = seaweedvfs_fh_to_dentry,
+	.fh_to_parent = seaweedvfs_fh_to_parent,
+	/* A remote, daemon-backed fs: attrs aren't atomic with ops and can change
+	 * on the filer behind our back, so weak cache consistency is meaningless.
+	 * The EXPORT_OP_* constants are #defines, so the #ifdef guards keep this
+	 * building on kernels that predate the newer flags. */
+	.flags = EXPORT_OP_NOWCC
+#ifdef EXPORT_OP_NOATOMIC_ATTR
+		| EXPORT_OP_NOATOMIC_ATTR
+#endif
+#ifdef EXPORT_OP_REMOTE_FS
+		| EXPORT_OP_REMOTE_FS
+#endif
+		,
+};
+
 static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct swvfs_mount *m;
@@ -2448,6 +2837,7 @@ static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_magic = SEAWEEDVFS_MAGIC;
 	sb->s_op = &seaweedvfs_super_ops;
 	SWVFS_SET_DEFAULT_D_OP(sb, &seaweedvfs_dentry_ops); /* keys on parent gen */
+	sb->s_export_op = &seaweedvfs_export_ops; /* NFS export (experimental) */
 	/* s_xattr lost an inner const across versions; cast to its actual type. */
 	sb->s_xattr = (typeof(sb->s_xattr))seaweedvfs_xattr_handlers;
 	sb->s_blocksize = PAGE_SIZE;

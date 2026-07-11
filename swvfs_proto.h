@@ -50,8 +50,19 @@
 			  * end (inclusive; ~0 = EOF), mtime_sec=owner id, valid bit
 			  * SWVFS_LOCK_FLOCK set for flock. reply.error: 0 granted/ok,
 			  * -EAGAIN on conflict. */
+#define SWVFS_OP_RESOLVE 23 /* resolve a (possibly renamed) NFS handle to its
+			     * current path via the daemon's forwarding index
+			     * (docs/nfs-stale-inode.md). path1 = the handle's
+			     * encoded path, offset = its inode, mode = kind
+			     * (0 file, 1 directory). Reply: verified current path
+			     * as reply data, or error -ESTALE. Best-effort: the
+			     * kernel falls back to ESTALE, never a wrong object
+			     * (it re-checks the inode after walking the answer). */
 
 #define SWVFS_XATTR_REMOVE 1 /* req.valid bit: removexattr (value absent) */
+#define SWVFS_EXPECT_DIR 2 /* req.valid bit on SETXATTR: expected_ino is a
+			    * directory generation, not a file inode (req.mode is
+			    * taken by the xattr flags, so the type rides here). */
 #define SWVFS_CREATE_EXCL 1 /* req.valid bit on CREATE: fail (EEXIST) if present */
 #define SWVFS_LOCK_FLOCK 1 /* req.valid bit on LOCK: flock-style (vs fcntl) */
 #define SWVFS_LOCK_TRY 0 /* req.mode on LOCK: try to acquire (non-blocking) */
@@ -60,6 +71,13 @@
 			    * reply: nentries=1 + attr{mode=type(1rd/2wr/3unlock),
 			    * size=start, mtime_sec=end, uid=pid} if a conflict
 			    * exists, else nentries=0. */
+
+/* req.mode on GETATTR: the type the handle expects, so the daemon rejects a
+ * type change before comparing identity (a file crafted with inode == an old
+ * directory generation must not satisfy a directory handle). 0 = an older
+ * kernel that sent no type (daemon infers from the entry). */
+#define SWVFS_GETATTR_FILE 1 /* expected a file; expected_ino is its inode */
+#define SWVFS_GETATTR_DIR 2  /* expected a dir; expected_ino is its generation */
 
 /* SETATTR field mask (req.valid) */
 #define SWVFS_SET_MODE (1u << 0)
@@ -127,7 +145,9 @@ struct swvfs_attr {
 	__u32 uid;
 	__u32 gid;
 	__u32 nlink;
-	__u32 rdev;
+	__u32 rdev; /* device (new_encode_dev); for DIRECTORIES: the 32-bit
+		     * generation (fold of the filer's stored inode) -> kernel
+		     * i_generation -> directory handles. 0 = unknown. */
 	__u32 mtime_nsec;
 	__u32 ctime_nsec;
 	__u32 atime_nsec;
@@ -142,7 +162,7 @@ struct swvfs_dirent {
 
 struct swvfs_req {
 	__u64 tag;
-	__u64 offset; /* READDIR cookie / READ|WRITE byte offset */
+	__u64 offset; /* READDIR cookie / READ|WRITE byte offset / RESOLVE inode */
 	__u64 size; /* READ count / SETATTR new size */
 	__s64 mtime_sec; /* SETATTR */
 	__s64 atime_sec; /* SETATTR */
@@ -156,8 +176,17 @@ struct swvfs_req {
 	__u32 gid; /* CREATE/MKDIR/SETATTR */
 	__u32 mtime_nsec; /* SETATTR */
 	__u32 atime_nsec; /* SETATTR */
-	__u32 _pad0;
-	__u32 _pad1;
+	/* READ/WRITE/SETATTR/GETATTR/SETXATTR (files)/LINK (source): the inode the
+	 * kernel expects `path1` to name. 0 = don't check (older kernels sent
+	 * zeroed padding here — wire-compatible). The daemon replies -ESTALE when
+	 * the path meanwhile names a different object (and refuses to attach a
+	 * write session/flush, an attr/xattr change, or a new hard link to it), so
+	 * a pre-invalidation cached dentry or a stale NFS handle can neither read,
+	 * write, stat, truncate/chmod, set an xattr on, nor link onto a recreated
+	 * file. Reads and getattr additionally REPOINT through the forwarding index
+	 * when the identified object still lives elsewhere (unlinked hard link with
+	 * survivors). */
+	__u64 expected_ino;
 	/* followed by: path1[plen1], path2[plen2], data[dlen] */
 }; /* 88 bytes header */
 
