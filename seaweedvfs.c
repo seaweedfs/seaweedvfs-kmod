@@ -69,7 +69,7 @@ module_param(distributed_locks, bool, 0444);
 MODULE_PARM_DESC(distributed_locks,
 		 "route advisory locks (flock) through the filer for cross-mount locking");
 
-#define SEAWEEDVFS_VERSION "0.1.7"
+#define SEAWEEDVFS_VERSION "0.1.8"
 #define SEAWEEDVFS_MAGIC 0x53574653 /* "SWFS" */
 #define SEAWEEDVFS_ROOT_INO 1
 #define SWVFS_TIMEOUT_MS 30000
