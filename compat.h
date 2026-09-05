@@ -7,7 +7,7 @@
  * module stays version-agnostic. Each shim is one self-contained unit, so the
  * complexity grows with the number of *changed APIs*, not the number of kernels.
  *
- * Supported range: 6.8 .. current mainline (7.0). The kernel build matrix
+ * Supported range: 6.8 .. current mainline (7.3). The kernel build matrix
  * (.github/workflows/) compiles the module against each target kernel and is the
  * source of truth for what is actually supported — when a build there breaks,
  * add the shim here.
@@ -97,6 +97,17 @@
 #endif
 
 /*
+ * The idmap of a file's mount, for calling a ->setattr hook directly rather
+ * than through notify_change (which builds one from the path). Same 6.3 split
+ * as SWVFS_IDMAP.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+# define SWVFS_FILE_IDMAP(file) file_mnt_idmap(file)
+#else
+# define SWVFS_FILE_IDMAP(file) file_mnt_user_ns(file)
+#endif
+
+/*
  * 6.6: inode mtime/atime setters, simple_inode_init_ts(), generic_fillattr()'s
  * request_mask arg, and memcpy_to_folio() landed together (inode_set_ctime*
  * predate 6.6 and are used directly). Mainline changes that no in-scope kernel
@@ -175,6 +186,26 @@
 #else
 # define SWVFS_LOOKUP_COMPONENT(name, base) \
 	lookup_one_len_unlocked((name), (base), strlen(name))
+#endif
+
+/*
+ * inode_operations->create() lost its trailing `bool excl` ("is this an O_EXCL
+ * create?"). vfs_create() had been passing true unconditionally ever since
+ * lookup_open() stopped calling it, so the argument carried no information and
+ * was removed ("vfs: remove the excl argument from the ->create()
+ * inode_operation"). We never read it — O_EXCL is handled in ->atomic_open,
+ * which the VFS calls in preference to ->create — so only the prototype moves.
+ * Feature-probed rather than version-guarded: an fs-callback signature is what a
+ * compile-test pins exactly and what enterprise distros backport.
+ * [HAVE_CREATE_NO_EXCL]
+ */
+#ifdef HAVE_CREATE_NO_EXCL
+# define SWVFS_CREATE_ARGS \
+	SWVFS_IDMAP idmap, struct inode *dir, struct dentry *dentry, umode_t mode
+#else
+# define SWVFS_CREATE_ARGS \
+	SWVFS_IDMAP idmap, struct inode *dir, struct dentry *dentry, umode_t mode, \
+	bool excl
 #endif
 
 /*

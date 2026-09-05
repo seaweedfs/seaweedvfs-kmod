@@ -136,4 +136,10 @@ sudo dkms install -m seaweedfs-vfs -v <version>
   lock service so they are honoured across mounts/clients (off by default; pair
   with the daemon's `--distributed-locks`).
 
+## Introspection
+
+`/proc/fs/seaweedvfs/status` (read-only) shows the daemon channel state —
+connected/transport/uptime, queued and in-flight request counts, invalidation
+pushes — and a per-op table (count, errors, timeouts, average latency).
+
 Issues and the rest of SeaweedFS: <https://github.com/seaweedfs/seaweedfs>.
