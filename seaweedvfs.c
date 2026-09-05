@@ -24,6 +24,7 @@
 #include <linux/dcache.h>
 #include <linux/delay.h>
 #include <linux/exportfs.h>	/* struct export_operations (NFS export) */
+#include <linux/falloc.h>	/* FALLOC_FL_* */
 #if __has_include(<linux/filelock.h>)
 #include <linux/filelock.h>	/* split out of fs.h in 6.5; absent on older LTS */
 #endif
@@ -33,6 +34,7 @@
 #include <linux/kernel.h>
 #include <linux/kref.h>
 #include <linux/list.h>
+#include <linux/math64.h>	/* div64_u64 for the /proc status averages */
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -41,9 +43,13 @@
 #include <linux/sched.h>
 #include <linux/sched/task.h>
 #include <linux/pagemap.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/statfs.h>
 #include <linux/string.h>
+#include <linux/hash.h>		/* hash_64 for the iget identity chain */
+#include <linux/stringhash.h>	/* full_name_hash for the iget identity key */
 #include <linux/uaccess.h>
 #include <linux/uidgid.h>
 #include <linux/uio.h>
@@ -81,6 +87,16 @@ MODULE_PARM_DESC(distributed_locks,
  * a backstop for the gaps the subscription can't cover (startup, a reconnect
  * window, a dropped invalidation) — hence seconds, not the old sub-second TTL. */
 #define SWVFS_ATTR_TTL_MS 30000
+#define SWVFS_WRITE_WINDOW 4 /* concurrent WRITE upcalls per writer; bounds
+			      * in-flight payload to 4 MiB, mirroring the 4 MiB
+			      * read-ahead window. The daemon applies same-file
+			      * writes in arrival order, so this only overlaps
+			      * channel round-trips, never reorders data. */
+#define SWVFS_READDIR_BATCH 128 /* dirents requested per READDIR upcall
+				  * (advertised in req.size). The daemon caps by
+				  * its own limit; older daemons ignore it and
+				  * send SWVFS_MAX_DIRENTS (32). ~43 KiB reply,
+				  * well within the ring slot buffer. */
 
 /* inode/time/uid helpers come from linux/fs.h; current_fsuid from linux/cred.h. */
 
@@ -91,6 +107,7 @@ MODULE_PARM_DESC(distributed_locks,
 struct swvfs_request {
 	struct list_head list;
 	u64 tag;
+	unsigned long start; /* submit time (jiffies) for the status latency counters */
 	struct swvfs_req req; /* header */
 	char *payload; /* path1|path2|data sent after the header, or NULL */
 	u32 payload_len;
@@ -114,6 +131,38 @@ static LIST_HEAD(swvfs_inflight); /* delivered, awaiting a reply */
 static DECLARE_WAIT_QUEUE_HEAD(swvfs_read_wq);
 static atomic64_t swvfs_tag = ATOMIC64_INIT(1);
 static bool swvfs_connected;
+
+/* ------------------------------------------------------------------ */
+/* Introspection counters, served via /proc/fs/seaweedvfs/status      */
+/* ------------------------------------------------------------------ */
+
+#define SWVFS_NR_OPS (SWVFS_OP_RESOLVE + 1) /* opcodes are 1..SWVFS_OP_RESOLVE */
+
+struct swvfs_op_stats {
+	atomic64_t submitted;
+	atomic64_t errors;   /* completed with a negative reply/channel error */
+	atomic64_t timeouts; /* waits that hit SWVFS_TIMEOUT_MS */
+	atomic64_t lat_ms;   /* cumulative submit-to-complete wait, ms */
+};
+static struct swvfs_op_stats swvfs_stats[SWVFS_NR_OPS];
+static atomic64_t swvfs_stat_connects;    /* daemon connections since load */
+static atomic64_t swvfs_stat_notconn;     /* submits refused: no daemon */
+static atomic64_t swvfs_stat_inval_push;  /* tag-0 invalidation pushes received */
+static atomic64_t swvfs_stat_inval_inode; /* cached inodes those pushes dropped */
+static unsigned long swvfs_connect_jiffies; /* when the daemon connected */
+
+/* Account a request's completion (or timeout/interrupt) for /proc status. */
+static void swvfs_stat_done(struct swvfs_request *r, int err)
+{
+	u32 op = r->req.op < SWVFS_NR_OPS ? r->req.op : 0;
+	struct swvfs_op_stats *s = &swvfs_stats[op];
+
+	atomic64_add(jiffies_to_msecs(jiffies - r->start), &s->lat_ms);
+	if (err == -ETIMEDOUT)
+		atomic64_inc(&s->timeouts);
+	else if (err < 0)
+		atomic64_inc(&s->errors);
+}
 
 /* Workqueue for asynchronous read-ahead: a window's folios are fetched off the
  * read path so the fetch overlaps the application consuming earlier pages. */
@@ -165,6 +214,11 @@ static DECLARE_RWSEM(swvfs_sb_sem);
 struct swvfs_inode {
 	struct inode vfs_inode;
 	atomic_t cache_gen;
+	u64 ident; /* iget identity tiebreak (parent ino ^ name hash) for
+		    * DIRECTORIES, whose ino is a path hash: tells two colliding
+		    * paths apart so they never fuse into one inode. 0 for files
+		    * (their ino is alias-shared/rename-stable — see
+		    * swvfs_iget_key) and the root. */
 };
 static struct kmem_cache *swvfs_inode_cachep;
 
@@ -210,7 +264,7 @@ static void swvfs_req_release(struct kref *kref)
 	struct swvfs_request *r = container_of(kref, struct swvfs_request, refcount);
 
 	kvfree(r->payload);
-	kfree(r->dirents);
+	kvfree(r->dirents); /* kvmalloc'd (a full readdir batch) */
 	kvfree(r->data); /* may be kvmalloc'd (large READ buffers) */
 	kfree(r);
 }
@@ -248,10 +302,14 @@ static int swvfs_submit(struct swvfs_request *r)
 	mutex_lock(&swvfs_lock);
 	if (!swvfs_connected) {
 		mutex_unlock(&swvfs_lock);
+		atomic64_inc(&swvfs_stat_notconn);
 		return -ENOTCONN;
 	}
 	r->tag = atomic64_inc_return(&swvfs_tag);
 	r->req.tag = r->tag;
+	r->start = jiffies;
+	atomic64_inc(&swvfs_stats[r->req.op < SWVFS_NR_OPS ? r->req.op : 0]
+			      .submitted);
 	r->answered = false;
 	init_completion(&r->done);
 	list_add_tail(&r->list, &swvfs_pending);
@@ -269,22 +327,26 @@ static int swvfs_wait(struct swvfs_request *r)
 {
 	long left = wait_for_completion_killable_timeout(
 		&r->done, msecs_to_jiffies(SWVFS_TIMEOUT_MS));
+	int err;
 
-	if (left > 0)
-		return r->reply.error;
-
-	mutex_lock(&swvfs_lock);
-	if (r->answered) {
+	if (left > 0) {
+		err = r->reply.error;
+	} else {
+		mutex_lock(&swvfs_lock);
+		if (r->answered) {
+			err = r->reply.error;
+		} else {
+			if (r->on_pending || r->on_inflight)
+				list_del_init(&r->list);
+			r->on_pending = false;
+			r->on_inflight = false;
+			r->answered = true;
+			err = left == 0 ? -ETIMEDOUT : -EINTR;
+		}
 		mutex_unlock(&swvfs_lock);
-		return r->reply.error;
 	}
-	if (r->on_pending || r->on_inflight)
-		list_del_init(&r->list);
-	r->on_pending = false;
-	r->on_inflight = false;
-	r->answered = true;
-	mutex_unlock(&swvfs_lock);
-	return left == 0 ? -ETIMEDOUT : -EINTR;
+	swvfs_stat_done(r, err);
+	return err;
 }
 
 /* Submit a request and block for the daemon's reply. */
@@ -390,12 +452,14 @@ static void swvfs_invalidate(u64 ino)
 
 	if (ino == 0)
 		return;
+	atomic64_inc(&swvfs_stat_inval_push);
 	down_read(&swvfs_sb_sem);
 	list_for_each_entry(m, &swvfs_mounts, node) {
 		struct inode *inode = ilookup(m->sb, ino);
 
 		if (!inode)
 			continue;
+		atomic64_inc(&swvfs_stat_inval_inode);
 		atomic_inc(&SWVFS_I(inode)->cache_gen);
 		inode->i_private = NULL; /* next getattr re-fetches */
 		invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
@@ -862,6 +926,8 @@ static int swvfs_dev_open(struct inode *inode, struct file *f)
 	}
 	swvfs_connected = true;
 	swvfs_transport = SWVFS_TP_NONE;
+	swvfs_connect_jiffies = jiffies;
+	atomic64_inc(&swvfs_stat_connects);
 	mutex_unlock(&swvfs_lock);
 	pr_info("seaweedvfs: daemon connected\n");
 	return 0;
@@ -938,6 +1004,77 @@ static struct miscdevice swvfs_miscdev = {
 	.mode = 0600,
 };
 
+/* /proc/fs/seaweedvfs/status: channel state and per-op counters, so the daemon
+ * channel can be triaged without instrumented builds (is the daemon connected,
+ * which transport, is something queued/stuck, which op class is slow/failing). */
+static int swvfs_status_show(struct seq_file *m, void *v)
+{
+	static const char *const op_names[SWVFS_NR_OPS] = {
+		[SWVFS_OP_LOOKUP] = "LOOKUP",	  [SWVFS_OP_READDIR] = "READDIR",
+		[SWVFS_OP_READ] = "READ",	  [SWVFS_OP_CREATE] = "CREATE",
+		[SWVFS_OP_MKDIR] = "MKDIR",	  [SWVFS_OP_UNLINK] = "UNLINK",
+		[SWVFS_OP_RMDIR] = "RMDIR",	  [SWVFS_OP_SETATTR] = "SETATTR",
+		[SWVFS_OP_WRITE] = "WRITE",	  [SWVFS_OP_FLUSH] = "FLUSH",
+		[SWVFS_OP_RELEASE] = "RELEASE",	  [SWVFS_OP_RENAME] = "RENAME",
+		[SWVFS_OP_GETATTR] = "GETATTR",	  [SWVFS_OP_SYMLINK] = "SYMLINK",
+		[SWVFS_OP_READLINK] = "READLINK", [SWVFS_OP_GETXATTR] = "GETXATTR",
+		[SWVFS_OP_SETXATTR] = "SETXATTR", [SWVFS_OP_LISTXATTR] = "LISTXATTR",
+		[SWVFS_OP_LINK] = "LINK",	  [SWVFS_OP_MKNOD] = "MKNOD",
+		[SWVFS_OP_STATFS] = "STATFS",	  [SWVFS_OP_LOCK] = "LOCK",
+		[SWVFS_OP_RESOLVE] = "RESOLVE",
+	};
+	static const char *const tp_names[] = { "none", "legacy", "ring" };
+	struct swvfs_request *r;
+	struct swvfs_mount *mnt;
+	unsigned int pending = 0, inflight = 0, mounts = 0;
+	unsigned long uptime = 0;
+	bool connected;
+	int transport, op;
+
+	mutex_lock(&swvfs_lock);
+	connected = swvfs_connected;
+	transport = swvfs_transport;
+	if (connected)
+		uptime = (jiffies - swvfs_connect_jiffies) / HZ;
+	list_for_each_entry(r, &swvfs_pending, list)
+		pending++;
+	list_for_each_entry(r, &swvfs_inflight, list)
+		inflight++;
+	mutex_unlock(&swvfs_lock);
+
+	down_read(&swvfs_sb_sem);
+	list_for_each_entry(mnt, &swvfs_mounts, node)
+		mounts++;
+	up_read(&swvfs_sb_sem);
+
+	seq_printf(m, "version: %s\n", SEAWEEDVFS_VERSION);
+	seq_printf(m, "daemon: %s\n", connected ? "connected" : "disconnected");
+	seq_printf(m, "transport: %s\n", tp_names[transport]);
+	seq_printf(m, "daemon_uptime_s: %lu\n", uptime);
+	seq_printf(m, "connects: %lld\n", atomic64_read(&swvfs_stat_connects));
+	seq_printf(m, "mounts: %u\n", mounts);
+	seq_printf(m, "pending: %u\n", pending);
+	seq_printf(m, "inflight: %u\n", inflight);
+	seq_printf(m, "notconn_errors: %lld\n", atomic64_read(&swvfs_stat_notconn));
+	seq_printf(m, "inval_pushes: %lld\n", atomic64_read(&swvfs_stat_inval_push));
+	seq_printf(m, "inval_inodes: %lld\n", atomic64_read(&swvfs_stat_inval_inode));
+	seq_printf(m, "%-9s %12s %10s %10s %8s\n", "op", "count", "errors",
+		   "timeouts", "avg_ms");
+	for (op = 1; op < SWVFS_NR_OPS; op++) {
+		u64 n = atomic64_read(&swvfs_stats[op].submitted);
+
+		if (!n)
+			continue;
+		seq_printf(m, "%-9s %12llu %10lld %10lld %8llu\n", op_names[op],
+			   n, atomic64_read(&swvfs_stats[op].errors),
+			   atomic64_read(&swvfs_stats[op].timeouts),
+			   div64_u64(atomic64_read(&swvfs_stats[op].lat_ms), n));
+	}
+	return 0;
+}
+
+static struct proc_dir_entry *swvfs_proc_dir;
+
 /* ------------------------------------------------------------------ */
 /* Filesystem                                                          */
 /* ------------------------------------------------------------------ */
@@ -986,7 +1123,66 @@ static void swvfs_apply_attr(struct inode *inode, const struct swvfs_attr *a)
 	inode->i_private = (void *)(jiffies | 1UL);
 }
 
-/* Get-or-create an inode with the daemon-assigned (hashed) number. */
+/* The inode-cache identity of a DIRECTORY: the daemon-assigned ino (a hash of
+ * the full path) plus a tiebreak derived from the parent's ino and the name.
+ * Two distinct paths can collide on the 64-bit hash alone; keyed only by ino
+ * (iget_locked) the pair would fuse into one inode — shared attrs and page
+ * cache across two objects. For directories the tiebreak is alias-stable, so
+ * it can split such a pair: a directory has no hard links, and a rename moves
+ * its path-hash ino together with its (parent, name). The tiebreak chains the
+ * parent's ident (see swvfs_ident), so it survives collision propagation:
+ * FNV-collided parents produce colliding same-named children, whose keys then
+ * differ only through the chained parent idents. (Userspace still sees
+ * equal st_ino for a colliding pair, and a daemon invalidation push —
+ * addressed by ino — reaches only the first match; the attr TTL and
+ * directory-generation backstops cover the other.)
+ *
+ * FILES keep ident 0 — identity is the daemon ino alone, exactly the old
+ * iget_locked semantics. A file's ino is NOT a path hash when the filer has
+ * more to say: it is the stored per-entry inode (stable across renames) or
+ * the hard-link id hash (deliberately shared by every link name), so a
+ * name-derived tiebreak would split those aliases into distinct inodes with
+ * distinct page caches — writes through one name leaving the other's cache
+ * stale. File-file hash collisions therefore remain possible; closing that
+ * needs an alias-stable per-object discriminator supplied by the daemon (a
+ * protocol extension), not one derived kernel-side from the name. */
+struct swvfs_iget_key {
+	u64 ino;
+	u64 ident;
+};
+
+static u64 swvfs_ident(struct inode *dir, const struct qstr *name)
+{
+	/* Chain the parent's own ident into the child's. The daemon's path-hash
+	 * ino runs suffix-forward (FNV), so two collided parent paths produce
+	 * colliding same-named children too — with the parents' inos equal, a
+	 * key mixing only dir->i_ino and the name would leave both children
+	 * fused as well. The parents' idents differ wherever their chains
+	 * first diverged (their own sibling names, or an ancestor's), so
+	 * hashing them in keeps every descendant pair distinct; hash_64
+	 * breaks the linearity a plain XOR chain would keep. */
+	return hash_64(SWVFS_I(dir)->ident ^ dir->i_ino, 64) ^
+	       full_name_hash(NULL, name->name, name->len);
+}
+
+static int swvfs_iget_test(struct inode *inode, void *data)
+{
+	const struct swvfs_iget_key *k = data;
+
+	return inode->i_ino == k->ino && SWVFS_I(inode)->ident == k->ident;
+}
+
+static int swvfs_iget_set(struct inode *inode, void *data)
+{
+	const struct swvfs_iget_key *k = data;
+
+	inode->i_ino = k->ino;
+	SWVFS_I(inode)->ident = k->ident;
+	return 0;
+}
+
+/* Get-or-create an inode with the daemon-assigned (hashed) number; `dir` and
+ * `name` are the entry it was resolved under (the identity tiebreak above). */
 /* `trust` says the attrs come from our own mutation (create/mkdir/mknod/symlink),
  * so reinitialize even a reused inode and drop its page cache: a path-hashed ino
  * can resolve to an unlink-while-open inode still cached at nlink 0 with stale
@@ -995,9 +1191,15 @@ static void swvfs_apply_attr(struct inode *inode, const struct swvfs_attr *a)
  * one risks masking an invalidation the reply raced, so the generation-guarded
  * getattr refreshes it instead. */
 static struct inode *swvfs_iget(struct super_block *sb,
-				const struct swvfs_attr *a, bool trust)
+				const struct swvfs_attr *a, struct inode *dir,
+				const struct qstr *name, bool trust)
 {
-	struct inode *inode = iget_locked(sb, a->ino);
+	struct swvfs_iget_key key = {
+		.ino = a->ino,
+		.ident = S_ISDIR(a->mode) ? swvfs_ident(dir, name) : 0,
+	};
+	struct inode *inode = iget5_locked(sb, a->ino, swvfs_iget_test,
+					   swvfs_iget_set, &key);
 
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
@@ -1129,6 +1331,41 @@ static int swvfs_read_into(const char *path, size_t plen, u64 ino, loff_t off,
 	}
 	kfree(reqs);
 	return err;
+}
+
+/* Build one WRITE sub-request for [off, off+chunk), copying the data straight
+ * from the caller's iov_iter into the request payload (no bounce buffer). The
+ * iter is advanced by `chunk` on success. `ino` as in swvfs_make_read. */
+static struct swvfs_request *swvfs_make_write(const char *path, size_t plen,
+					      u64 ino, loff_t off,
+					      struct iov_iter *from, size_t chunk)
+{
+	struct swvfs_request *r = kzalloc(sizeof(*r), GFP_KERNEL);
+
+	if (!r)
+		return ERR_PTR(-ENOMEM);
+	kref_init(&r->refcount);
+	r->req.op = SWVFS_OP_WRITE;
+	r->req.plen1 = plen;
+	r->req.dlen = chunk;
+	r->req.offset = off;
+	/* The identity this writer holds open: the daemon refuses (ESTALE) if the
+	 * path meanwhile names a different object, so a stale NFS handle or
+	 * pre-invalidation dentry can't modify a recreated file. */
+	r->req.expected_ino = ino;
+	r->payload_len = plen + chunk;
+	r->payload = kvmalloc(r->payload_len, GFP_KERNEL);
+	if (!r->payload) {
+		kfree(r);
+		return ERR_PTR(-ENOMEM);
+	}
+	memcpy(r->payload, path, plen);
+	if (copy_from_iter(r->payload + plen, chunk, from) != chunk) {
+		kvfree(r->payload);
+		kfree(r);
+		return ERR_PTR(-EFAULT);
+	}
+	return r;
 }
 
 static int seaweedvfs_read_folio(struct file *file, struct folio *folio)
@@ -1327,7 +1564,8 @@ static void swvfs_prime_dcache(struct dentry *parent, struct swvfs_dirent *d,
 	dentry = d_alloc(parent, &name);
 	if (!dentry)
 		return;
-	inode = swvfs_iget(parent->d_sb, &d->attr, false);
+	inode = swvfs_iget(parent->d_sb, &d->attr, d_inode(parent), &name,
+			   false);
 	if (IS_ERR(inode)) {
 		dput(dentry);
 		return;
@@ -1371,15 +1609,16 @@ static int seaweedvfs_readdir(struct file *file, struct dir_context *ctx)
 			err = -ENOMEM;
 			break;
 		}
-		r->dirents = kmalloc_array(SWVFS_MAX_DIRENTS,
-					   sizeof(struct swvfs_dirent),
-					   GFP_KERNEL);
+		r->dirents = kvmalloc_array(SWVFS_READDIR_BATCH,
+					    sizeof(struct swvfs_dirent),
+					    GFP_KERNEL);
 		if (!r->dirents) {
 			swvfs_free_req(r);
 			err = -ENOMEM;
 			break;
 		}
-		r->max_dirents = SWVFS_MAX_DIRENTS;
+		r->max_dirents = SWVFS_READDIR_BATCH;
+		r->req.size = SWVFS_READDIR_BATCH; /* our per-batch capacity */
 		r->req.offset = ctx->pos - 2; /* exclude "." and ".." */
 
 		err = swvfs_send(r);
@@ -1455,7 +1694,8 @@ static struct dentry *seaweedvfs_lookup(struct inode *dir,
 	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr, false);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, dir,
+				   &dentry->d_name, false);
 		if (IS_ERR(inode)) {
 			err = PTR_ERR(inode);
 			inode = NULL;
@@ -1560,12 +1800,18 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 	r->req.mode = mode;
 	r->req.uid = from_kuid(&init_user_ns, current_fsuid());
 	r->req.gid = from_kgid(&init_user_ns, current_fsgid());
+	/* Both callers are exclusive by contract: mkdir(2) must fail on an existing
+	 * name, and ->create is reached only through vfs_create(), which passes excl
+	 * unconditionally (open(O_CREAT) goes through ->atomic_open). Without this
+	 * the daemon's create is an upsert and two nodes racing a name both win. */
+	r->req.valid = SWVFS_CREATE_EXCL;
 
 	/* Parent generation sampled before the RPC (see swvfs_stamp_dentry). */
 	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, dir,
+				   &dentry->d_name, true);
 		if (IS_ERR(inode)) {
 			err = PTR_ERR(inode);
 		} else {
@@ -1586,8 +1832,7 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 	return err;
 }
 
-static int seaweedvfs_create(SWVFS_IDMAP idmap, struct inode *dir,
-			     struct dentry *dentry, umode_t mode, bool excl)
+static int seaweedvfs_create(SWVFS_CREATE_ARGS)
 {
 	return swvfs_make(dir, dentry, mode, SWVFS_OP_CREATE);
 }
@@ -1653,7 +1898,8 @@ static int seaweedvfs_atomic_open(struct inode *dir, struct dentry *dentry,
 	if (err == 0) {
 		struct dentry *alias = NULL;
 
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, dir,
+				   &dentry->d_name, true);
 		swvfs_free_req(r);
 		if (IS_ERR(inode))
 			return PTR_ERR(inode);
@@ -1722,7 +1968,8 @@ static int seaweedvfs_mknod(SWVFS_IDMAP idmap, struct inode *dir,
 	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, dir,
+				   &dentry->d_name, true);
 		if (IS_ERR(inode))
 			err = PTR_ERR(inode);
 		else {
@@ -1844,6 +2091,36 @@ static int seaweedvfs_setattr(SWVFS_IDMAP idmap, struct dentry *dentry,
 	return err;
 }
 
+/* Volume space is assigned when a write reaches the filer, so nothing can be
+ * reserved up front: a range inside the file is answered OK untouched, and one
+ * past the end grows the file the way a truncate would. Without this hook the
+ * VFS answers EOPNOTSUPP and glibc's posix_fallocate falls back to an emulation
+ * that preads through the caller's descriptor, which is EBADF when it was
+ * opened write-only. */
+static long seaweedvfs_fallocate(struct file *file, int mode, loff_t offset,
+				 loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	struct iattr iattr = {};
+	long err;
+
+	if (mode & ~FALLOC_FL_KEEP_SIZE)
+		return -EOPNOTSUPP;
+	if ((mode & FALLOC_FL_KEEP_SIZE) || offset + len <= i_size_read(inode))
+		return 0;
+
+	iattr.ia_valid = ATTR_SIZE | ATTR_FILE;
+	iattr.ia_size = offset + len;
+	iattr.ia_file = file;
+
+	/* setattr expects i_rwsem held for write, as notify_change takes it. */
+	inode_lock(inode);
+	err = seaweedvfs_setattr(SWVFS_FILE_IDMAP(file), file->f_path.dentry,
+				 &iattr);
+	inode_unlock(inode);
+	return err;
+}
+
 static int seaweedvfs_symlink(SWVFS_IDMAP idmap, struct inode *dir,
 			      struct dentry *dentry, const char *symname)
 {
@@ -1875,7 +2152,8 @@ static int seaweedvfs_symlink(SWVFS_IDMAP idmap, struct inode *dir,
 	gen = atomic_read(&SWVFS_I(dir)->cache_gen);
 	err = swvfs_send(r);
 	if (err == 0) {
-		inode = swvfs_iget(dir->i_sb, &r->reply.attr, true);
+		inode = swvfs_iget(dir->i_sb, &r->reply.attr, dir,
+				   &dentry->d_name, true);
 		if (IS_ERR(inode))
 			err = PTR_ERR(inode);
 		else {
@@ -2046,7 +2324,16 @@ static int seaweedvfs_link(struct dentry *old_dentry, struct inode *dir,
 
 /* Synchronous write-through: each write streams via WRITE upcalls (the daemon
  * buffers and flushes on close/fsync); cached pages for the range are then
- * invalidated so reads see the new data. */
+ * invalidated so reads see the new data.
+ *
+ * Chunks are submitted a window at a time so the concurrent daemon overlaps
+ * their channel round-trips (mirroring swvfs_read_into); it applies same-file
+ * writes in arrival order, so the data cannot be reordered. The window is
+ * reaped in submission order: each chunk's wait timeout starts only once the
+ * chunks before it completed, so a window shares no timeout budget. On a
+ * failure, only the contiguous prefix is reported written — a later chunk may
+ * still have reached the daemon, which is the same ambiguity any short write
+ * to a remote filesystem has (nothing is durable until flush either way). */
 static ssize_t seaweedvfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
 	struct file *file = iocb->ki_filp;
@@ -2080,45 +2367,64 @@ static ssize_t seaweedvfs_write_iter(struct kiocb *iocb, struct iov_iter *from)
 	pos = (file->f_flags & O_APPEND) ? i_size_read(inode) : iocb->ki_pos;
 	start = pos;
 
-	while (iov_iter_count(from) > 0) {
-		size_t chunk = min_t(size_t, iov_iter_count(from), SWVFS_MAX_WRITE);
-		struct swvfs_request *r;
-		void *tmp = kvmalloc(chunk, GFP_KERNEL);
+	while (iov_iter_count(from) > 0 && !err) {
+		struct swvfs_request *reqs[SWVFS_WRITE_WINDOW];
+		size_t chunks[SWVFS_WRITE_WINDOW];
+		unsigned int n = 0, i;
+		int suberr = 0;
 
-		if (!tmp) {
-			err = -ENOMEM;
-			break;
+		while (n < SWVFS_WRITE_WINDOW && iov_iter_count(from) > 0) {
+			size_t chunk = min_t(size_t, iov_iter_count(from),
+					     SWVFS_MAX_WRITE);
+			struct swvfs_request *r =
+				swvfs_make_write(path, plen, inode->i_ino,
+						 pos, from, chunk);
+
+			if (IS_ERR(r)) {
+				suberr = PTR_ERR(r);
+				break;
+			}
+			if (swvfs_submit(r)) {
+				swvfs_free_req(r);
+				suberr = -ENOTCONN;
+				break;
+			}
+			reqs[n] = r;
+			chunks[n] = chunk;
+			n++;
+			pos += chunk;
 		}
-		if (copy_from_iter(tmp, chunk, from) != chunk) {
-			kvfree(tmp);
-			err = -EFAULT;
-			break;
+
+		/* Reap before surfacing a build/submit failure: that failure
+		 * sits logically AFTER the submitted chunks (they cover earlier
+		 * file ranges), and those may complete — e.g. a bad iovec after
+		 * a valid first chunk must return the short prefix as written,
+		 * not an error that hides applied data (and would duplicate an
+		 * append on retry). */
+		for (i = 0; i < n; i++) {
+			int e = swvfs_wait(reqs[i]);
+
+			if (e && !err)
+				err = e;
+			else if (!err)
+				written += chunks[i];
+			swvfs_free_req(reqs[i]);
 		}
-		r = swvfs_make_req(SWVFS_OP_WRITE, path, plen, NULL, 0, tmp,
-				   chunk);
-		kvfree(tmp);
-		if (!r) {
-			err = -ENOMEM;
-			break;
-		}
-		r->req.offset = pos;
-		/* The identity this writer holds open: the daemon refuses (ESTALE)
-		 * if the path meanwhile names a different object, so a stale NFS
-		 * handle or pre-invalidation dentry can't modify a recreated file. */
-		r->req.expected_ino = inode->i_ino;
-		err = swvfs_send(r);
-		swvfs_free_req(r);
-		if (err)
-			break;
-		pos += chunk;
-		written += chunk;
+		if (!err)
+			err = suberr;
 	}
 
-	if (written > 0) {
-		if (pos > i_size_read(inode))
-			i_size_write(inode, pos);
-		SWVFS_INODE_SET_MTIME_TS(inode, inode_set_ctime_current(inode));
-		iocb->ki_pos = pos;
+	if (pos > start) {
+		if (written > 0) {
+			if (start + written > i_size_read(inode))
+				i_size_write(inode, start + written);
+			SWVFS_INODE_SET_MTIME_TS(inode,
+						 inode_set_ctime_current(inode));
+			iocb->ki_pos = start + written;
+		}
+		/* Invalidate the whole attempted range, not just the reported
+		 * prefix: on a mid-window failure a later chunk may have been
+		 * applied, so cached pages past the prefix are suspect too. */
 		invalidate_inode_pages2_range(inode->i_mapping,
 					      start >> PAGE_SHIFT,
 					      (pos - 1) >> PAGE_SHIFT);
@@ -2173,6 +2479,35 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 	bool unlock = SWVFS_FL_IS_UNLOCK(fl);
 	u32 type = unlock ? 3 : (SWVFS_FL_IS_READ(fl) ? 1 : 2);
 
+	/* A distributed lock is a coherence point, not just mutual exclusion:
+	 * lock-mediated applications expect acquire -> read to see everything
+	 * the previous holder wrote before its unlock. WRITE upcalls are
+	 * write-through to the daemon, but the daemon publishes staged data to
+	 * the filer only on FLUSH — so flush before releasing, making our
+	 * writes visible to the next holder. Not gated on this file's
+	 * FMODE_WRITE (unlike close's flush): the lock fd is often read-only —
+	 * flock(1) opens O_RDONLY while the writes went through another fd —
+	 * and the daemon's buffer is per-path, so flush is a no-op when
+	 * nothing is staged. A failed flush still releases (a held-forever
+	 * lock is worse; durability remains fsync's contract). */
+	if (unlock && !getlk) {
+		struct swvfs_request *fr =
+			swvfs_req_from_dentry(SWVFS_OP_FLUSH,
+					      file->f_path.dentry);
+		int ferr;
+
+		if (IS_ERR(fr)) {
+			ferr = PTR_ERR(fr);
+		} else {
+			ferr = swvfs_send(fr);
+			swvfs_free_req(fr);
+		}
+		if (ferr)
+			pr_warn_ratelimited(
+				"seaweedvfs: pre-unlock flush failed: %d\n",
+				ferr);
+	}
+
 	for (;;) {
 		struct swvfs_request *r;
 		char *buf, *path;
@@ -2223,8 +2558,19 @@ static int swvfs_dist_lock(struct file *file, struct file_lock *fl,
 			locks_lock_file_wait(file, fl);
 			return 0;
 		}
-		if (err == 0)
+		if (err == 0) {
+			/* The other half of the coherence point: the previous
+			 * holder's writes may predate our cached pages/attrs,
+			 * and its invalidation push may still be in flight.
+			 * Drop this inode's cache so reads under the lock
+			 * re-fetch (same actions as a pushed invalidation). */
+			struct inode *inode = file_inode(file);
+
+			atomic_inc(&SWVFS_I(inode)->cache_gen);
+			inode->i_private = NULL;
+			invalidate_inode_pages2_range(inode->i_mapping, 0, -1);
 			return locks_lock_file_wait(file, fl); /* record locally */
+		}
 		if (err == -EAGAIN && blocking) {
 			if (msleep_interruptible(50))
 				return -EINTR;
@@ -2444,6 +2790,7 @@ static const struct file_operations seaweedvfs_file_ops = {
 	.mmap = generic_file_readonly_mmap,
 	.flush = seaweedvfs_flush,
 	.fsync = seaweedvfs_fsync,
+	.fallocate = seaweedvfs_fallocate,
 	.release = seaweedvfs_release_file,
 };
 
@@ -2456,6 +2803,7 @@ static const struct file_operations seaweedvfs_file_ops_dlm = {
 	.mmap = generic_file_readonly_mmap,
 	.flush = seaweedvfs_flush,
 	.fsync = seaweedvfs_fsync,
+	.fallocate = seaweedvfs_fallocate,
 	.release = seaweedvfs_release_file,
 	.flock = seaweedvfs_flock,
 	.lock = seaweedvfs_lock,
@@ -2466,11 +2814,10 @@ static const struct address_space_operations seaweedvfs_aops = {
 	.readahead = seaweedvfs_readahead,
 };
 
-/* Filesystem-wide stats from the daemon (filer Statistics RPC). */
-static int seaweedvfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+/* Fetch filesystem-wide stats from the daemon (filer Statistics RPC). */
+static int swvfs_statfs_fetch(struct swvfs_statfs *st)
 {
 	struct swvfs_request *r;
-	struct swvfs_statfs st;
 	int err;
 
 	r = swvfs_make_req(SWVFS_OP_STATFS, "/", 1, NULL, 0, NULL, 0);
@@ -2492,8 +2839,48 @@ static int seaweedvfs_statfs(struct dentry *dentry, struct kstatfs *buf)
 		swvfs_free_req(r);
 		return -EIO;
 	}
-	memcpy(&st, r->data, sizeof(st));
+	memcpy(st, r->data, sizeof(*st));
 	swvfs_free_req(r);
+	return 0;
+}
+
+/* statfs answers change slowly, but df-polling monitoring agents call it every
+ * few seconds and each call was a full upcall round trip. Serve a short-TTL
+ * cache instead; global like the upcall itself (one daemon per host, and the
+ * request is always for "/"). The mutex also dedupes a concurrent df storm
+ * into one upcall. */
+#define SWVFS_STATFS_TTL_MS 2000
+static struct swvfs_statfs swvfs_statfs_cache;
+static unsigned long swvfs_statfs_stamp; /* jiffies|1 of the last fetch; 0 = never */
+static DEFINE_MUTEX(swvfs_statfs_lock);
+
+static int swvfs_statfs_cached(struct swvfs_statfs *st)
+{
+	int err = 0;
+
+	mutex_lock(&swvfs_statfs_lock);
+	if (swvfs_statfs_stamp &&
+	    time_before(jiffies, swvfs_statfs_stamp +
+				 msecs_to_jiffies(SWVFS_STATFS_TTL_MS))) {
+		*st = swvfs_statfs_cache;
+	} else {
+		err = swvfs_statfs_fetch(st);
+		if (!err) {
+			swvfs_statfs_cache = *st;
+			swvfs_statfs_stamp = jiffies | 1UL;
+		}
+	}
+	mutex_unlock(&swvfs_statfs_lock);
+	return err;
+}
+
+static int seaweedvfs_statfs(struct dentry *dentry, struct kstatfs *buf)
+{
+	struct swvfs_statfs st;
+	int err = swvfs_statfs_cached(&st);
+
+	if (err)
+		return err;
 
 	buf->f_type = SEAWEEDVFS_MAGIC;
 	buf->f_bsize = st.bsize;
@@ -2521,6 +2908,7 @@ static struct inode *swvfs_alloc_inode(struct super_block *sb)
 	if (!si)
 		return NULL;
 	atomic_set(&si->cache_gen, 0);
+	si->ident = 0;
 	return &si->vfs_inode;
 }
 
@@ -2831,8 +3219,29 @@ static const struct export_operations seaweedvfs_export_ops = {
 static int seaweedvfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct swvfs_mount *m;
+	struct swvfs_statfs st;
 	struct inode *root;
+	bool connected;
 	int err;
+
+	/* Fail the mount when it cannot work, instead of succeeding and
+	 * returning ENOTCONN from every operation: require a connected daemon,
+	 * then probe through it to the filer with a live statfs (a daemon that
+	 * cannot reach its filer is equally dead). BeeGFS-style mount sanity
+	 * check; bounded by the 30s upcall timeout and killable. */
+	mutex_lock(&swvfs_lock);
+	connected = swvfs_connected;
+	mutex_unlock(&swvfs_lock);
+	if (!connected) {
+		pr_warn("seaweedvfs: mount refused: no daemon connected on /dev/seaweedvfs\n");
+		return -ENOTCONN;
+	}
+	err = swvfs_statfs_fetch(&st);
+	if (err) {
+		pr_warn("seaweedvfs: mount refused: daemon/filer probe failed: %d\n",
+			err);
+		return err;
+	}
 
 	sb->s_magic = SEAWEEDVFS_MAGIC;
 	sb->s_op = &seaweedvfs_super_ops;
@@ -2943,9 +3352,16 @@ static int __init seaweedvfs_init(void)
 		kmem_cache_destroy(swvfs_inode_cachep);
 		return err;
 	}
+	/* Introspection; the module works without it, so failure is not fatal. */
+	swvfs_proc_dir = proc_mkdir("fs/seaweedvfs", NULL);
+	if (swvfs_proc_dir)
+		proc_create_single("status", 0444, swvfs_proc_dir,
+				   swvfs_status_show);
 	err = register_filesystem(&seaweedvfs_fs_type);
 	if (err) {
 		pr_err("seaweedvfs: register_filesystem failed: %d\n", err);
+		if (swvfs_proc_dir)
+			remove_proc_subtree("fs/seaweedvfs", NULL);
 		misc_deregister(&swvfs_miscdev);
 		destroy_workqueue(swvfs_ra_wq);
 		kmem_cache_destroy(swvfs_inode_cachep);
@@ -2959,6 +3375,8 @@ static int __init seaweedvfs_init(void)
 static void __exit seaweedvfs_exit(void)
 {
 	unregister_filesystem(&seaweedvfs_fs_type);
+	if (swvfs_proc_dir)
+		remove_proc_subtree("fs/seaweedvfs", NULL);
 	misc_deregister(&swvfs_miscdev);
 	destroy_workqueue(swvfs_ra_wq); /* drains any in-flight read-ahead */
 	/* free_inode returns inodes to the slab via RCU; wait for those callbacks

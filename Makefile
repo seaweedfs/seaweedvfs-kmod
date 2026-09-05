@@ -32,6 +32,7 @@ compat-config.h: FORCE
 	@$(call probe,set_default_d_op,HAVE_SET_DEFAULT_D_OP)
 	@$(call probe,d_revalidate_dir,HAVE_D_REVALIDATE_DIR)
 	@$(call probe,lookup_noperm,HAVE_LOOKUP_NOPERM)
+	@$(call probe,create_no_excl,HAVE_CREATE_NO_EXCL)
 	@rm -f compat-probes/Kbuild compat-probes/*.o compat-probes/*.ko \
 		compat-probes/*.mod* compat-probes/.*.cmd \
 		compat-probes/modules.order compat-probes/Module.symvers 2>/dev/null || true
