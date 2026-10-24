@@ -96,7 +96,7 @@
 #define SWVFS_PATH_MAX 8192
 #define SWVFS_NAME_MAX 255
 #define SWVFS_NAME_BUF 256
-#define SWVFS_MAX_DIRENTS 32
+#define SWVFS_MAX_DIRENTS 32 /* legacy READDIR batch, assumed when req.size == 0 */
 #define SWVFS_MAX_WRITE (1u << 20)
 
 /*
@@ -163,7 +163,9 @@ struct swvfs_dirent {
 struct swvfs_req {
 	__u64 tag;
 	__u64 offset; /* READDIR cookie / READ|WRITE byte offset / RESOLVE inode */
-	__u64 size; /* READ count / SETATTR new size */
+	__u64 size; /* READ count / SETATTR new size / READDIR: max dirents the
+		     * kernel's reply buffer accepts (0 = a pre-negotiation
+		     * kernel: send SWVFS_MAX_DIRENTS) */
 	__s64 mtime_sec; /* SETATTR */
 	__s64 atime_sec; /* SETATTR */
 	__u32 op;
