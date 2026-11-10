@@ -1586,8 +1586,7 @@ static int swvfs_make(struct inode *dir, struct dentry *dentry, umode_t mode,
 	return err;
 }
 
-static int seaweedvfs_create(SWVFS_IDMAP idmap, struct inode *dir,
-			     struct dentry *dentry, umode_t mode, bool excl)
+static int seaweedvfs_create(SWVFS_CREATE_ARGS)
 {
 	return swvfs_make(dir, dentry, mode, SWVFS_OP_CREATE);
 }
