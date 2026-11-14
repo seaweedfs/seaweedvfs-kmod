@@ -102,6 +102,17 @@
 #endif
 
 /*
+ * The idmap of a file's mount, for calling a ->setattr hook directly rather
+ * than through notify_change (which builds one from the path). Same 6.3 split
+ * as SWVFS_IDMAP.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+# define SWVFS_FILE_IDMAP(file) file_mnt_idmap(file)
+#else
+# define SWVFS_FILE_IDMAP(file) file_mnt_user_ns(file)
+#endif
+
+/*
  * 6.6: inode mtime/atime setters, simple_inode_init_ts(), generic_fillattr()'s
  * request_mask arg, and memcpy_to_folio() landed together (inode_set_ctime*
  * predate 6.6 and are used directly). Mainline changes that no in-scope kernel
