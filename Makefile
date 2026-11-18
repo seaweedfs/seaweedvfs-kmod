@@ -34,6 +34,7 @@ compat-config.h: FORCE
 	@$(call probe,lookup_noperm,HAVE_LOOKUP_NOPERM)
 	@$(call probe,create_no_excl,HAVE_CREATE_NO_EXCL)
 	@$(call probe,const_mnt_idmap,HAVE_CONST_MNT_IDMAP)
+	@$(call probe,mkdir_dentry,HAVE_MKDIR_DENTRY)
 	@rm -f compat-probes/Kbuild compat-probes/*.o compat-probes/*.ko \
 		compat-probes/*.mod* compat-probes/.*.cmd \
 		compat-probes/modules.order compat-probes/Module.symvers 2>/dev/null || true
