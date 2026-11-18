@@ -39,8 +39,9 @@
  * 6.13: inode_operations->mkdir returns `struct dentry *` instead of `int`
  * (NULL keeps the passed-in dentry, ERR_PTR(err) signals failure).
  * commit cd3e8c0c50a0e ("fs: change the signature of ->mkdir").
+ * RHEL 10's 6.12 backports it. [HAVE_MKDIR_DENTRY]
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+#if defined(HAVE_MKDIR_DENTRY) || LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 # define SWVFS_MKDIR_RET          struct dentry *
 # define SWVFS_MKDIR_RESULT(err)  ({ int __e = (err); __e ? ERR_PTR(__e) : NULL; })
 #else
@@ -99,6 +100,17 @@
 # define SWVFS_IDMAP struct mnt_idmap *
 #else
 # define SWVFS_IDMAP struct user_namespace *
+#endif
+
+/*
+ * The idmap of a file's mount, for calling a ->setattr hook directly rather
+ * than through notify_change (which builds one from the path). Same 6.3 split
+ * as SWVFS_IDMAP.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+# define SWVFS_FILE_IDMAP(file) file_mnt_idmap(file)
+#else
+# define SWVFS_FILE_IDMAP(file) file_mnt_user_ns(file)
 #endif
 
 /*
